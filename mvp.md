@@ -57,6 +57,12 @@ MVP must not include:
 
 ## Protocol Requirements
 
+### Protocol architecture boundary
+- Treat protocol logic as a small shared library boundary, not scattered UI event logic.
+- Keep protocol parsing/assembly, sender transmission logic, and receiver state machine logic in dedicated protocol/service modules.
+- UI layer should orchestrate and render state, but must not own low-level frame parsing/serialization rules.
+- Message formats and valid state transitions must be documented and testable outside browser view code.
+
 ### Frame types
 MVP supports exactly:
 - `HEADER`
@@ -79,6 +85,11 @@ No extra frame types.
 - `transferId` is required in every frame.
 - Once locked to an active transfer, receiver must ignore any frame type (`HEADER`, `DATA`, or `END`) whose `transferId` does not match the active transfer until `SUCCESS`, `ERROR`, or manual reset.
 - A new header with a different `transferId` must not silently merge into current transfer.
+
+### Typed messages and states
+- Frame/message categories must be explicit typed variants/classes (for MVP: `HEADER`, `DATA`, `END`) instead of inferred flags/booleans.
+- Sender and receiver states must be explicit typed states with constrained transitions.
+- Error handling must use explicit machine-readable error categories/codes plus user-facing messages.
 
 ## Sender Behavior
 
@@ -167,6 +178,11 @@ B) No unique progress timeout -> fail when no new unique packet arrives for `150
 - Duplicate packets must not reset this timer.
 
 User-facing timeout copy: **"Transfer incomplete. Some packets were missed. Restart sender."**
+
+### Error model
+- Use structured machine-readable error codes (for example: protocol parse error, invalid frame version, invalid transfer/session, invalid packet index, checksum mismatch, timeout, session/attempt expired).
+- Map each error code to clear user-facing copy; avoid relying on free-form strings for logic.
+- Tests should assert error codes where relevant, not only message text.
 
 ### Ignorable frames vs terminal errors
 Frames that may be ignored without entering terminal `ERROR`:
@@ -277,6 +293,11 @@ Do not build for hostile/noisy multi-sender conditions, but still prevent cross-
 
 ## Required Testing Before MVP Sign-off
 
+### Test harness architecture
+- Core transfer/protocol logic must be testable with fake I/O (mock frame readers/writers or equivalent abstractions).
+- Protocol and state-machine tests must run without camera/scanner/QR renderer dependencies.
+- UI/integration tests may cover scanner/renderer wiring, but correctness should primarily be validated in core logic tests.
+
 ### Protocol tests
 - HEADER roundtrip parse/assemble
 - DATA roundtrip parse/assemble
@@ -303,6 +324,10 @@ Do not build for hostile/noisy multi-sender conditions, but still prevent cross-
 - No unique progress timeout (`15000 ms`) becomes terminal failure
 - Full packet set + matching CRC becomes success
 - Zero-byte file path is deterministic (explicit success/failure, no hang)
+
+### Empty-file coverage
+- Zero-byte file sender path emits deterministic frame sequence and terminal state.
+- Zero-byte file receiver path verifies deterministically with explicit success/failure reason (no hangs/timeouts due to missing data packets).
 
 ## MVP Acceptance Criteria
 MVP is complete only if all are true:
