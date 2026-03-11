@@ -1,6 +1,6 @@
 import './style.css';
 import QRCode from 'qrcode';
-import { assemblePacket, chunkFile, type Packet } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, assembleFrame, chunkFile, type TransferFrame } from '@qr-data-bridge/protocol';
 
 const QR_PREFIX = 'QDB64:';
 const SETTINGS_KEY = 'qdb_sender_settings_v2';
@@ -16,6 +16,8 @@ const logger = {
   },
   error: (...args: unknown[]) => console.error(...args)
 };
+
+let sharedAudioContext: AudioContext | null = null;
 
 interface SenderSettings {
   frameDurationMs: number;
@@ -89,8 +91,25 @@ function saveSettings(settings: SenderSettings): void {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 }
 
+function getAudioContext(): AudioContext {
+  if (!sharedAudioContext) {
+    sharedAudioContext = new AudioContext();
+  }
+  return sharedAudioContext;
+}
+
+async function resumeAudioContext(): Promise<void> {
+  if (!settings.soundEnabled) return;
+  const context = getAudioContext();
+  if (context.state === 'suspended') {
+    await context.resume();
+  }
+}
+
 function playClickSound(): void {
-  const context = new AudioContext();
+  if (!settings.soundEnabled) return;
+  const context = getAudioContext();
+  if (context.state !== 'running') return;
   const oscillator = context.createOscillator();
   const gain = context.createGain();
   oscillator.type = 'square';
@@ -143,6 +162,7 @@ app.innerHTML = `
     <div id="eta-meta">ETA: -</div>
     <div id="speed-meta">Estimated Speed: -</div>
     <div id="countdown-meta"></div>
+    <div id="wake-lock-warning" class="warning"></div>
     <div id="warning-meta" class="warning"></div>
     <small>Keep brightness high. Do not minimize this tab during transfer.</small>
   </aside>
@@ -155,12 +175,13 @@ const etaMeta = getElement<HTMLDivElement>('#eta-meta');
 const speedMeta = getElement<HTMLDivElement>('#speed-meta');
 const countdownMeta = getElement<HTMLDivElement>('#countdown-meta');
 const warningMeta = getElement<HTMLDivElement>('#warning-meta');
+const wakeLockWarningEl = getElement<HTMLDivElement>('#wake-lock-warning');
 const startButton = getElement<HTMLButtonElement>('#start-btn');
 const stopButton = getElement<HTMLButtonElement>('#stop-btn');
 const resetButton = getElement<HTMLButtonElement>('#reset-btn');
-const stageEl = getElement<HTMLElement>('#stage');
-const qrShell = getElement<HTMLDivElement>('#qr-shell');
 const qrCanvas = getElement<HTMLCanvasElement>('#qr-canvas');
+const stageEl = getElement<HTMLDivElement>('#stage');
+const qrShell = getElement<HTMLDivElement>('#qr-shell');
 const frameDurationInput = getElement<HTMLInputElement>('#frame-duration');
 const frameDurationLabel = getElement<HTMLSpanElement>('#frame-duration-label');
 const errorCorrectionSelect = getElement<HTMLSelectElement>('#error-correction');
@@ -175,8 +196,8 @@ const soundEnabledInput = getElement<HTMLInputElement>('#sound-enabled');
 const themeButton = getElement<HTMLButtonElement>('#theme-btn');
 
 let settings = readSettings();
-let packets: Packet[] = [];
-let streamPackets: Packet[] = [];
+let transmissionFrames: TransferFrame[] = [];
+let streamFrames: TransferFrame[] = [];
 let fileBytes: Uint8Array | null = null;
 let selectedFileName = '';
 let currentStreamIndex = 0;
@@ -198,11 +219,17 @@ function estimatedSpeedBytesPerSec(): number {
   return Math.floor((effectiveChunkSize() / settings.redundancyCount) * (1000 / settings.frameDurationMs));
 }
 
+function frameLabel(frame: TransferFrame): string {
+  if (frame.frameType === FRAME_TYPE_HEADER) return 'HEADER';
+  if (frame.frameType === FRAME_TYPE_END) return 'END';
+  return `DATA #${frame.packetIndex + 1}`;
+}
+
 function refreshEstimates(): void {
   const speed = estimatedSpeedBytesPerSec();
   speedMeta.textContent = `Estimated Speed: ${speed} B/s`;
   if (fileBytes) {
-    const estimatedMs = Math.ceil(streamPackets.length * settings.frameDurationMs);
+    const estimatedMs = Math.ceil(streamFrames.length * settings.frameDurationMs);
     etaMeta.textContent = `Estimated Time: ${formatDuration(estimatedMs)}`;
     const warnings: string[] = [];
     if (estimatedMs > 10 * 60 * 1000) warnings.push('File Too Large: estimated transfer exceeds 10 minutes.');
@@ -230,26 +257,44 @@ function updateSettingsUi(): void {
   qrShell.style.setProperty('--qr-size', `${settings.qrSizePx}px`);
 }
 
-function rebuildPackets(): void {
+function rebuildFrames(): void {
   if (!fileBytes) return;
-  packets = chunkFile(fileBytes, { fileName: selectedFileName, maxPayloadSize: effectiveChunkSize() });
-  streamPackets = packets.flatMap((packet) => Array.from({ length: settings.redundancyCount }, () => packet));
-  fileMeta.textContent = `${selectedFileName} • ${fileBytes.length} bytes • ${packets.length} unique packets • ${streamPackets.length} total scans`;
+  const transfer = chunkFile(fileBytes, { fileName: selectedFileName, maxPayloadSize: effectiveChunkSize(), includeEndFrame: true });
+  transmissionFrames = [transfer.header, ...transfer.dataFrames, ...(transfer.endFrame ? [transfer.endFrame] : [])];
+  const nextStreamFrames: TransferFrame[] = [];
+  for (const frame of transmissionFrames) {
+    if (frame.frameType === FRAME_TYPE_DATA) {
+      for (let i = 0; i < settings.redundancyCount; i += 1) nextStreamFrames.push(frame);
+    } else {
+      nextStreamFrames.push(frame);
+    }
+  }
+  streamFrames = nextStreamFrames;
+  fileMeta.textContent = `${selectedFileName} • ${fileBytes.length} bytes • ${transfer.dataFrames.length} packets • ${streamFrames.length} total scans`;
   refreshEstimates();
 }
 
 function persistAndRefresh(): void {
   saveSettings(settings);
   updateSettingsUi();
-  rebuildPackets();
+  rebuildFrames();
+}
+
+function setWakeLockWarning(message: string): void {
+  wakeLockWarningEl.textContent = message;
 }
 
 async function requestWakeLock(): Promise<void> {
-  if (!('wakeLock' in navigator)) return;
+  if (!('wakeLock' in navigator)) {
+    setWakeLockWarning('⚠️ Auto-Sleep Disabled: Keep Screen On Manually');
+    return;
+  }
   try {
     wakeLock = await navigator.wakeLock.request('screen');
+    setWakeLockWarning('');
   } catch (error) {
     logger.error('Wake lock failed', error);
+    setWakeLockWarning('⚠️ Auto-Sleep Disabled: Keep Screen On Manually');
   }
 }
 
@@ -267,41 +312,38 @@ function stopTransmission(message = 'Transmission stopped.'): void {
   stageEl.classList.remove('transmitting');
   countdownMeta.textContent = '';
   stopButton.disabled = true;
-  startButton.disabled = packets.length === 0;
+  startButton.disabled = transmissionFrames.length === 0;
   releaseWakeLock();
-  if (packets.length > 0) packetMeta.textContent = message;
+  if (transmissionFrames.length > 0) packetMeta.textContent = message;
 }
 
-async function renderPacket(index: number): Promise<void> {
-  const packet = streamPackets[index];
-  const payload = `${QR_PREFIX}${bytesToBase64(assemblePacket(packet))}`;
+async function renderFrame(index: number): Promise<void> {
+  const frame = streamFrames[index];
+  const payload = `${QR_PREFIX}${bytesToBase64(assembleFrame(frame))}`;
   await QRCode.toCanvas(qrCanvas, payload, {
     errorCorrectionLevel: settings.qrErrorCorrection,
     width: settings.qrSizePx,
     margin: 1,
     color: { dark: '#000000', light: '#FFFFFF' }
   });
-  const packetNumber = packet.packetIndex + 1;
-  const uniqueLeft = packets.length - packetNumber;
-  packetMeta.textContent = `Sending packet ${packetNumber}/${packets.length} • scan ${index + 1}/${streamPackets.length}`;
-  etaMeta.textContent = `ETA: ${formatDuration(uniqueLeft * settings.redundancyCount * settings.frameDurationMs)}`;
+  packetMeta.textContent = `Sending ${frameLabel(frame)} • scan ${index + 1}/${streamFrames.length}`;
   if (settings.soundEnabled) playClickSound();
-  logger.debug('[sender] rendered', { index, packetIndex: packet.packetIndex });
+  logger.debug('[sender] rendered', { index });
 }
 
-function scheduleNextPacket(): void {
-  if (!isTransmitting || streamPackets.length === 0) return;
+function scheduleNextFrame(): void {
+  if (!isTransmitting || streamFrames.length === 0) return;
   transmissionTimer = window.setTimeout(async () => {
     if (!isTransmitting) return;
     const nextIndex = currentStreamIndex + 1;
-    if (nextIndex >= streamPackets.length) {
+    if (nextIndex >= streamFrames.length) {
       stopTransmission('Transfer Complete');
       return;
     }
     currentStreamIndex = nextIndex;
     try {
-      await renderPacket(currentStreamIndex);
-      scheduleNextPacket();
+      await renderFrame(currentStreamIndex);
+      scheduleNextFrame();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown QR encoding error.';
       stopTransmission(`QR encode failed: ${message}`);
@@ -318,8 +360,8 @@ function startCountdownAndTransmit(): void {
       stageEl.classList.add('transmitting');
       await requestWakeLock();
       try {
-        await renderPacket(0);
-        scheduleNextPacket();
+        await renderFrame(0);
+        scheduleNextFrame();
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown QR encoding error.';
         stopTransmission(`QR encode failed: ${message}`);
@@ -360,6 +402,7 @@ redundancyInput.addEventListener('input', () => {
 });
 soundEnabledInput.addEventListener('change', () => {
   settings.soundEnabled = soundEnabledInput.checked;
+  void resumeAudioContext();
   persistAndRefresh();
 });
 
@@ -369,11 +412,12 @@ themeButton.addEventListener('click', () => {
 });
 
 fileInput.addEventListener('change', async () => {
+  await resumeAudioContext();
   stopTransmission();
   const selectedFile = fileInput.files?.[0];
   if (!selectedFile) {
-    packets = [];
-    streamPackets = [];
+    transmissionFrames = [];
+    streamFrames = [];
     fileBytes = null;
     selectedFileName = '';
     fileMeta.textContent = 'No file selected.';
@@ -384,8 +428,8 @@ fileInput.addEventListener('change', async () => {
   }
 
   if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
-    packets = [];
-    streamPackets = [];
+    transmissionFrames = [];
+    streamFrames = [];
     fileBytes = null;
     selectedFileName = '';
     fileMeta.textContent = 'File too large (10MB max).';
@@ -396,14 +440,15 @@ fileInput.addEventListener('change', async () => {
 
   fileBytes = new Uint8Array(await selectedFile.arrayBuffer());
   selectedFileName = selectedFile.name;
-  rebuildPackets();
+  rebuildFrames();
   currentStreamIndex = 0;
   packetMeta.textContent = 'Ready to transmit.';
   startButton.disabled = false;
 });
 
 startButton.addEventListener('click', () => {
-  if (!streamPackets.length) return;
+  void resumeAudioContext();
+  if (!streamFrames.length) return;
   stopTransmission();
   isTransmitting = true;
   currentStreamIndex = 0;
@@ -415,8 +460,8 @@ startButton.addEventListener('click', () => {
 stopButton.addEventListener('click', () => stopTransmission());
 resetButton.addEventListener('click', () => {
   stopTransmission('Ready to transmit.');
-  packets = [];
-  streamPackets = [];
+  transmissionFrames = [];
+  streamFrames = [];
   fileBytes = null;
   selectedFileName = '';
   fileInput.value = '';
@@ -439,3 +484,6 @@ const preferredTheme = localStorage.getItem(THEME_KEY) === 'light' ? 'light' : '
 setTheme(preferredTheme);
 updateSettingsUi();
 refreshEstimates();
+if (!('wakeLock' in navigator)) {
+  setWakeLockWarning('⚠️ Auto-Sleep Disabled: Keep Screen On Manually');
+}
