@@ -74,15 +74,15 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [x] Make `ERROR` terminal for current attempt (no silent continued merging).
 
 ### 4.2 Passive-only constraints
-- [ ] Keep receiver fully passive: no ACK/NACK/requests and no assumptions sender can react.
+- [x] Keep receiver fully passive: no ACK/NACK/requests and no assumptions sender can react.
 
 ### 4.3 Ignorable frames vs terminal errors
-- [ ] While scanning, treat these as ignorable (non-terminal):
+- [x] While scanning, treat these as ignorable (non-terminal):
   - DATA before valid HEADER
   - duplicate DATA for existing packet index
   - non-matching `transferId` frames
   - malformed/noise frames
-- [ ] Reserve terminal `ERROR` for:
+- [x] Reserve terminal `ERROR` for:
   - camera failure
   - END seen while incomplete after grace window
   - no unique progress timeout
@@ -104,7 +104,7 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [x] Do not silently continue receiving into failed attempt.
 
 ### 4.7 Zero-byte files
-- [ ] Support zero-byte files with deterministic behavior (explicit success/failure path, no hangs).
+- [x] Support zero-byte files with deterministic behavior (explicit success/failure path, no hangs).
 
 ---
 

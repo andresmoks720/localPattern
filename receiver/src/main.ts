@@ -248,7 +248,7 @@ function failTransfer(statusMessage: string, warningMessage: string, detail?: st
 }
 
 async function finalizeTransfer(): Promise<void> {
-  if (!transferState.totalPackets || transferState.fileCrc32 === null) return;
+  if (transferState.totalPackets === null || transferState.fileCrc32 === null) return;
   if (currentStage === 'VERIFYING' || currentStage === 'SUCCESS') return;
   setStage('VERIFYING', 'Verifying...');
 
@@ -325,6 +325,18 @@ function updateSignalHealth(): void {
   if (
     currentStage === 'RECEIVING' &&
     transferState.headerReceived &&
+    transferState.totalPackets === 0 &&
+    endSeenAt === null &&
+    lastUniquePacketAt > 0 &&
+    now - lastUniquePacketAt >= NO_UNIQUE_PROGRESS_TIMEOUT_MS
+  ) {
+    failTransfer('Transfer Failed (No END)', 'Zero-byte transfer timed out waiting for END frame. Restart sender.');
+    return;
+  }
+
+  if (
+    currentStage === 'RECEIVING' &&
+    transferState.headerReceived &&
     transferState.totalPackets !== null &&
     transferState.receivedPackets.size < transferState.totalPackets
   ) {
@@ -371,6 +383,13 @@ function processFrame(now: number): void {
           rafId = requestAnimationFrame(processFrame);
           return;
         }
+        const dataTransferId = transferIdToKey(frame.transferId);
+        if (dataTransferId !== transferState.transferId) {
+          logger.debug('[receiver] ignoring data frame for non-active transfer', dataTransferId);
+          rafId = requestAnimationFrame(processFrame);
+          return;
+        }
+
         if (frame.packetIndex < 0 || frame.packetIndex >= transferState.totalPackets) {
           logger.debug('[receiver] ignoring out-of-range packet index', frame.packetIndex);
           rafId = requestAnimationFrame(processFrame);
@@ -402,6 +421,12 @@ function processFrame(now: number): void {
         }
 
         logger.debug('[receiver] end frame observed', frame.transferId);
+        if (transferState.totalPackets === 0) {
+          void finalizeTransfer();
+          rafId = requestAnimationFrame(processFrame);
+          return;
+        }
+
         if (transferState.totalPackets !== null && transferState.receivedPackets.size < transferState.totalPackets) {
           endSeenAt = Date.now();
           warningEl.textContent = 'END received, waiting for missing packets...';

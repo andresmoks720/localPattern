@@ -84,13 +84,15 @@ function assembleDataFrame(frame: TransferDataFrame): Uint8Array {
     throw new Error('packetCrc32 mismatch for data payload.');
   }
 
-  const bytes = new Uint8Array(4 + 1 + 2 + frame.payload.length + 4);
+  assertTransferId(frame.transferId);
+  const bytes = new Uint8Array(4 + 1 + TRANSFER_ID_SIZE + 2 + frame.payload.length + 4);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   bytes.set(MAGIC_BYTES, 0);
   view.setUint8(4, FRAME_TYPE_DATA);
-  view.setUint16(5, frame.packetIndex);
-  bytes.set(frame.payload, 7);
-  view.setUint32(7 + frame.payload.length, frame.packetCrc32);
+  bytes.set(frame.transferId, 5);
+  view.setUint16(13, frame.packetIndex);
+  bytes.set(frame.payload, 15);
+  view.setUint32(15 + frame.payload.length, frame.packetCrc32);
   return bytes;
 }
 
@@ -162,13 +164,14 @@ function parseHeaderFrame(frameBytes: Uint8Array): TransferHeaderFrame {
 }
 
 function parseDataFrame(frameBytes: Uint8Array): TransferDataFrame {
-  if (frameBytes.length < 4 + 1 + 2 + 4) {
+  if (frameBytes.length < 4 + 1 + TRANSFER_ID_SIZE + 2 + 4) {
     throw new Error('Data frame is too small.');
   }
 
   const view = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
-  const packetIndex = view.getUint16(5);
-  const payloadStart = 7;
+  const transferId = frameBytes.slice(5, 13);
+  const packetIndex = view.getUint16(13);
+  const payloadStart = 15;
   const payloadEnd = frameBytes.length - 4;
 
   if (payloadEnd < payloadStart) {
@@ -184,6 +187,7 @@ function parseDataFrame(frameBytes: Uint8Array): TransferDataFrame {
 
   return {
     frameType: FRAME_TYPE_DATA,
+    transferId,
     packetIndex,
     payload,
     packetCrc32
@@ -230,6 +234,7 @@ export function chunkFile(file: Uint8Array, options: ChunkFileOptions = {}): Chu
     const payload = file.slice(start, end);
     dataFrames.push({
       frameType: FRAME_TYPE_DATA,
+      transferId: transferId.slice(),
       packetIndex,
       payload,
       packetCrc32: calculateCRC32(payload)

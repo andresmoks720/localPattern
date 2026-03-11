@@ -17,6 +17,7 @@ export interface TransferHeaderFrame {
 
 export interface TransferDataFrame {
   frameType: typeof FRAME_TYPE_DATA;
+  transferId: Uint8Array;
   packetIndex: number;
   payload: Uint8Array;
   packetCrc32: number;
