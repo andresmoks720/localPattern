@@ -5,9 +5,10 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 ## 0) Priority order (recommended)
 1. **Protocol correctness first** (`transferId` in DATA, lock/isolation rules).
 2. **Receiver terminal behavior** (fixed timeouts + END-incomplete failure).
-3. **Sender hard limits + explicit state machine + error surfacing**.
-4. **Required tests** (protocol/sender/receiver).
-5. **UI copy alignment**.
+3. **Protocol-as-library boundaries + typed message/state model**.
+4. **Sender hard limits + explicit state machine + error surfacing**.
+5. **Required tests** (protocol/sender/receiver + fake I/O harness).
+6. **UI copy alignment**.
 
 ---
 
@@ -21,10 +22,20 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 
 ## 2) Protocol conformance (`HEADER` / `DATA` / `END`)
 
+### 2.0 Library boundary and documentation
+- [ ] Keep protocol logic in library-ish modules, not scattered across UI handlers.
+- [ ] Separate concerns clearly: frame parse/assemble, sender transport flow, receiver reassembly/state machine.
+- [ ] Document message formats and valid state transitions in protocol docs/spec notes.
+
 ### 2.1 Frame fields
 - [ ] Add `transferId` to **DATA** frame type, assembly, and parsing.
 - [ ] Include/validate **protocol version** explicitly per frame format (current parser mostly relies on magic bytes).
 - [ ] Keep supported frame types exactly `HEADER`, `DATA`, `END` only.
+
+### 2.5 Typed messages and explicit error classes
+- [ ] Use explicit typed message variants/classes for `HEADER` / `DATA` / `END` (avoid ad hoc boolean-driven shape checks).
+- [ ] Introduce/keep explicit machine-readable protocol error categories/codes (not string-only errors).
+- [ ] Ensure protocol/state logic branches on error codes, while UI maps codes to user copy.
 
 ### 2.2 Transfer identity and lock isolation
 - [ ] Receiver must lock on first valid HEADER and then ignore all non-matching frames (including HEADER) until `SUCCESS`, `ERROR`, or manual reset.
@@ -105,6 +116,7 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 
 ### 4.7 Zero-byte files
 - [ ] Support zero-byte files with deterministic behavior (explicit success/failure path, no hangs).
+- [ ] Add explicit sender behavior for zero-byte files (deterministic frame sequence and terminal state).
 
 ---
 
@@ -143,6 +155,11 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 
 ## 7) Required tests (must exist before MVP sign-off)
 
+### 7.0 Test harness / fake I/O
+- [ ] Add/maintain core tests using fake reader/writer I/O abstractions for transfer logic.
+- [ ] Ensure protocol/state-machine correctness is validated without camera/scanner/QR renderer.
+- [ ] Keep scanner/renderer tests separate from core protocol tests.
+
 ### 7.1 Protocol tests
 - [ ] HEADER roundtrip parse/assemble
 - [ ] DATA roundtrip parse/assemble
@@ -152,6 +169,7 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] wrong protocol magic/version rejected
 - [ ] `transferId` required and validated
 - [ ] DATA with wrong `transferId` ignored by receiver logic
+- [ ] structured protocol error codes are emitted for representative failures
 
 ### 7.2 Sender tests
 - [ ] file > 1 MiB rejected
@@ -169,6 +187,7 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] full packet set + matching CRC becomes success
 - [ ] out-of-range packet index handling verified
 - [ ] zero-byte file deterministic completion verified
+- [ ] session identity (`transferId`) is required in all frame types and enforced through full receive lifecycle
 
 ---
 
