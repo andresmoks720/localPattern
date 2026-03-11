@@ -1,0 +1,23 @@
+{
+  "name": "qr-data-bridge",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "protocol",
+    "sender",
+    "receiver"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev:sender": "npm run dev -w sender",
+    "dev:receiver": "npm run dev -w receiver",
+    "typecheck": "npm run typecheck --workspaces",
+    "size:check": "npm run build --workspaces"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^5.9.2",
+    "vite": "^5.4.10",
+    "vite-plugin-pwa": "^0.20.5"
+  }
+}

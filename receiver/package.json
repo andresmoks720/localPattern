@@ -1,0 +1,16 @@
+{
+  "name": "receiver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5174",
+    "build": "vite build",
+    "preview": "vite preview --port 4174",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@qr-data-bridge/protocol": "*",
+    "jsqr": "^1.4.0"
+  }
+}
