@@ -1,6 +1,6 @@
 import './style.css';
 import jsQR from 'jsqr';
-import { calculateCRC32, parsePacket } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, calculateCRC32, parseFrame, type TransferHeaderFrame } from '@qr-data-bridge/protocol';
 
 const QR_PREFIX = 'QDB64:';
 const SCAN_INTERVAL_MS = 300;
@@ -16,14 +16,19 @@ const logger = {
   error: (...args: unknown[]) => console.error(...args)
 };
 
+let sharedAudioContext: AudioContext | null = null;
+
 type ReceiverStage = 'IDLE' | 'SCANNING' | 'RECEIVING' | 'VERIFYING' | 'SUCCESS' | 'ERROR';
 
 interface TransferState {
+  transferId: string | null;
   totalPackets: number | null;
+  expectedFileSize: number | null;
   receivedPackets: Map<number, Uint8Array>;
-  fileHash: number | null;
+  fileCrc32: number | null;
   fileName: string;
   totalScans: number;
+  headerReceived: boolean;
 }
 
 function base64ToBytes(base64: string): Uint8Array {
@@ -40,7 +45,16 @@ function getElement<T extends Element>(selector: string): T {
 }
 
 function createTransferState(): TransferState {
-  return { totalPackets: null, receivedPackets: new Map<number, Uint8Array>(), fileHash: null, fileName: '', totalScans: 0 };
+  return {
+    transferId: null,
+    totalPackets: null,
+    expectedFileSize: null,
+    receivedPackets: new Map<number, Uint8Array>(),
+    fileCrc32: null,
+    fileName: '',
+    totalScans: 0,
+    headerReceived: false
+  };
 }
 
 function concatPayloads(payloads: Uint8Array[]): Uint8Array {
@@ -54,8 +68,31 @@ function concatPayloads(payloads: Uint8Array[]): Uint8Array {
   return out;
 }
 
+function transferIdToKey(transferId: Uint8Array): string {
+  return Array.from(transferId)
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function getAudioContext(): AudioContext {
+  if (!sharedAudioContext) {
+    sharedAudioContext = new AudioContext();
+  }
+  return sharedAudioContext;
+}
+
+async function resumeAudioContext(): Promise<void> {
+  if (!soundEnabled) return;
+  const context = getAudioContext();
+  if (context.state === 'suspended') {
+    await context.resume();
+  }
+}
+
 function playDing(): void {
-  const context = new AudioContext();
+  if (!soundEnabled) return;
+  const context = getAudioContext();
+  if (context.state !== 'running') return;
   const o1 = context.createOscillator();
   const o2 = context.createOscillator();
   const gain = context.createGain();
@@ -88,7 +125,7 @@ app.innerHTML = `
     <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Completion sound</label>
     <div id="status" class="status">Ready to scan</div>
     <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
-    <div id="progress-text">Packet 0/0 (0%)</div>
+    <div id="progress-text">Waiting for header...</div>
     <div id="scan-stats">Received 0 scans → 0 unique packets</div>
     <div id="last-received-time">Last packet: -</div>
     <div id="warning" class="warning"></div>
@@ -141,9 +178,9 @@ function setStage(stage: ReceiverStage, message: string): void {
 function updateProgress(): void {
   const total = transferState.totalPackets ?? 0;
   const received = transferState.receivedPackets.size;
-  const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+  const pct = transferState.headerReceived && total > 0 ? Math.floor((received / total) * 100) : 0;
   progressBar.style.width = `${pct}%`;
-  progressText.textContent = `Packet ${received}/${total} (${pct}%)`;
+  progressText.textContent = transferState.headerReceived ? `Packet ${received}/${total} (${pct}%)` : 'Waiting for header...';
   scanStatsEl.textContent = `Received ${transferState.totalScans} scans → ${received} unique packets`;
 }
 
@@ -170,23 +207,33 @@ function resetTransferState(clearWarning = true): void {
   lastReceivedTimeEl.textContent = 'Last packet: -';
 }
 
-function missingPacketIds(totalPackets: number, packets: Map<number, Uint8Array>): number[] {
-  const missing: number[] = [];
-  for (let i = 0; i < totalPackets; i += 1) if (!packets.has(i)) missing.push(i);
-  return missing;
+function applyHeaderFrame(header: TransferHeaderFrame): void {
+  const incomingTransferId = transferIdToKey(header.transferId);
+  if (transferState.headerReceived && transferState.transferId && transferState.transferId !== incomingTransferId) {
+    warningEl.textContent = 'Sender restarted. Session reset automatically.';
+    transferState = createTransferState();
+  }
+
+  transferState.headerReceived = true;
+  transferState.transferId = incomingTransferId;
+  transferState.fileName = header.fileName || 'received.bin';
+  transferState.expectedFileSize = header.fileSize;
+  transferState.totalPackets = header.totalPackets;
+  transferState.fileCrc32 = header.fileCrc32;
+  setStage('RECEIVING', 'Header received. Listening for packets...');
+  lastPacketEl.textContent = `${transferState.fileName} • ${header.fileSize} bytes • ${header.totalPackets} packets`;
 }
 
 async function finalizeTransfer(): Promise<void> {
-  if (!transferState.totalPackets || transferState.fileHash === null) return;
-  setStage('VERIFYING', 'Checking integrity...');
+  if (!transferState.totalPackets || transferState.fileCrc32 === null) return;
+  setStage('VERIFYING', 'Verifying...');
 
   const ordered: Uint8Array[] = [];
   for (let i = 0; i < transferState.totalPackets; i += 1) {
     const payload = transferState.receivedPackets.get(i);
     if (!payload) {
-      logger.debug('[receiver] missed packet ids', missingPacketIds(transferState.totalPackets, transferState.receivedPackets));
       setStage('ERROR', 'Transfer Failed (Missing Packets)');
-      warningEl.textContent = 'Transmission started before scan. Please restart sender.';
+      warningEl.textContent = 'Missing packets detected. Please restart sender.';
       resetTransferState(false);
       return;
     }
@@ -194,12 +241,18 @@ async function finalizeTransfer(): Promise<void> {
   }
 
   const fileBytes = concatPayloads(ordered);
-  const computedHash = calculateCRC32(fileBytes);
-  if (computedHash !== transferState.fileHash) {
-    logger.debug('[receiver] missed packet ids', missingPacketIds(transferState.totalPackets, transferState.receivedPackets));
-    setStage('ERROR', 'Transfer Failed (Hash Mismatch)');
-    warningEl.textContent = 'File Corrupted. Try slowing down transmission.';
-    lastPacketEl.textContent = `Expected CRC32 ${transferState.fileHash.toString(16)} got ${computedHash.toString(16)}`;
+  const computedCrc = calculateCRC32(fileBytes);
+  if (computedCrc !== transferState.fileCrc32) {
+    setStage('ERROR', 'Transfer Failed (CRC32 Mismatch)');
+    warningEl.textContent = 'File Corrupted. Retry transfer with slower frame rate.';
+    lastPacketEl.textContent = `Expected CRC32 ${transferState.fileCrc32.toString(16)} got ${computedCrc.toString(16)}`;
+    resetTransferState(false);
+    return;
+  }
+
+  if (transferState.expectedFileSize !== null && fileBytes.length !== transferState.expectedFileSize) {
+    setStage('ERROR', 'Transfer Failed (Size Mismatch)');
+    warningEl.textContent = 'File size mismatch detected. Please retry transfer.';
     resetTransferState(false);
     return;
   }
@@ -269,23 +322,29 @@ function processFrame(now: number): void {
     lastDecodedPayload = result.data;
     transferState.totalScans += 1;
     try {
-      const packet = parsePacket(base64ToBytes(result.data.slice(QR_PREFIX.length)));
-      if (transferState.totalPackets === null) {
-        transferState.totalPackets = packet.totalPackets;
-        transferState.fileHash = packet.fileHash;
-        transferState.fileName = packet.fileName;
-        if (packet.packetIndex !== 0) warningEl.textContent = 'Transmission started before scan. Please restart sender.';
-      }
+      const frame = parseFrame(base64ToBytes(result.data.slice(QR_PREFIX.length)));
+      if (frame.frameType === FRAME_TYPE_HEADER) {
+        applyHeaderFrame(frame);
+      } else if (frame.frameType === FRAME_TYPE_DATA) {
+        if (!transferState.headerReceived || transferState.totalPackets === null) {
+          warningEl.textContent = 'Waiting for header frame. Restart sender if needed.';
+          updateProgress();
+          rafId = requestAnimationFrame(processFrame);
+          return;
+        }
+        if (frame.packetIndex < transferState.totalPackets && !transferState.receivedPackets.has(frame.packetIndex)) {
+          transferState.receivedPackets.set(frame.packetIndex, frame.payload);
+        }
 
-      if (!transferState.receivedPackets.has(packet.packetIndex)) {
-        transferState.receivedPackets.set(packet.packetIndex, packet.payload);
+        setStage('RECEIVING', 'Listening for packets...');
+        lastPacketEl.textContent = `Packet ${frame.packetIndex + 1}/${transferState.totalPackets} received.`;
+      } else if (frame.frameType === FRAME_TYPE_END) {
+        logger.debug('[receiver] end frame observed', frame.transferId);
       }
 
       lastPacketAt = Date.now();
       lastReceivedTimeEl.textContent = `Last packet: ${new Date(lastPacketAt).toLocaleTimeString()}`;
-      setStage('RECEIVING', 'Listening for packets...');
       updateProgress();
-      lastPacketEl.textContent = `Packet ${packet.packetIndex + 1}/${packet.totalPackets} received.`;
       if (transferState.totalPackets !== null && transferState.receivedPackets.size === transferState.totalPackets) {
         void finalizeTransfer();
       }
@@ -308,7 +367,7 @@ async function startScan(): Promise<void> {
     activeStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
     video.srcObject = activeStream;
     await video.play();
-    setStage('SCANNING', 'Listening for packets...');
+    setStage('SCANNING', 'Listening for header frame...');
     lastDecodedPayload = '';
     lastScanAt = 0;
     scanStartedAt = Date.now();
@@ -322,6 +381,7 @@ async function startScan(): Promise<void> {
 }
 
 scanButton.addEventListener('click', async () => {
+  await resumeAudioContext();
   if (activeStream) {
     stopScanLoop(true);
     return;
@@ -331,6 +391,7 @@ scanButton.addEventListener('click', async () => {
 
 soundEnabledInput.addEventListener('change', () => {
   soundEnabled = soundEnabledInput.checked;
+  void resumeAudioContext();
 });
 
 themeButton.addEventListener('click', () => {

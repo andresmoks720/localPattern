@@ -21,6 +21,11 @@ npm run dev:sender
 npm run dev:receiver
 ```
 
+## Protocol Migration Note (V2)
+- Protocol V2 (`QDB2`) is **not backward compatible** with Protocol V1 (`QDB1`).
+- V2 receivers reject V1 packets with `Version Mismatch`.
+- Upgrade sender and receiver together when moving to v2.0.0-beta.
+
 ## Calibration Guide (Sender Settings)
 Defaults are tuned for reliability: **2000ms frame duration**, **H ECC**, **400px QR**, **3x redundancy**, **Auto chunk size**.
 
