@@ -1,6 +1,7 @@
 import './style.css';
 import jsQR from 'jsqr';
 import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, calculateCRC32, parseFrame, type TransferHeaderFrame } from '@qr-data-bridge/protocol';
+import { decideDataFrameHandling, decideTimeoutHandling } from './receiverRules';
 
 const QR_PREFIX = 'QDB64:';
 const SCAN_INTERVAL_MS = 300;
@@ -322,32 +323,29 @@ function updateSignalHealth(): void {
     warningEl.textContent = 'Signal Lost - Check Alignment';
   }
 
-  if (
-    currentStage === 'RECEIVING' &&
-    transferState.headerReceived &&
-    transferState.totalPackets === 0 &&
-    endSeenAt === null &&
-    lastUniquePacketAt > 0 &&
-    now - lastUniquePacketAt >= NO_UNIQUE_PROGRESS_TIMEOUT_MS
-  ) {
+  const timeoutDecision = decideTimeoutHandling({
+    now,
+    headerReceived: transferState.headerReceived,
+    totalPackets: transferState.totalPackets,
+    receivedPacketsCount: transferState.receivedPackets.size,
+    endSeenAt,
+    lastUniquePacketAt,
+    endGraceWindowMs: END_GRACE_WINDOW_MS,
+    noUniqueProgressTimeoutMs: NO_UNIQUE_PROGRESS_TIMEOUT_MS
+  });
+
+  if (timeoutDecision === 'no-end-zero-byte') {
     failTransfer('Transfer Failed (No END)', 'Zero-byte transfer timed out waiting for END frame. Restart sender.');
     return;
   }
 
-  if (
-    currentStage === 'RECEIVING' &&
-    transferState.headerReceived &&
-    transferState.totalPackets !== null &&
-    transferState.receivedPackets.size < transferState.totalPackets
-  ) {
-    if (endSeenAt !== null && now - endSeenAt >= END_GRACE_WINDOW_MS) {
-      failTransfer('Transfer Failed (Incomplete END)', 'Transfer incomplete, restart sender.');
-      return;
-    }
+  if (timeoutDecision === 'incomplete-end') {
+    failTransfer('Transfer Failed (Incomplete END)', 'Transfer incomplete, restart sender.');
+    return;
+  }
 
-    if (lastUniquePacketAt > 0 && now - lastUniquePacketAt >= NO_UNIQUE_PROGRESS_TIMEOUT_MS) {
-      failTransfer('Transfer Failed (No Progress)', 'No unique packets received for 15 seconds. Restart sender.');
-    }
+  if (timeoutDecision === 'no-unique-progress') {
+    failTransfer('Transfer Failed (No Progress)', 'No unique packets received for 15 seconds. Restart sender.');
   }
 }
 
@@ -377,31 +375,41 @@ function processFrame(now: number): void {
       if (frame.frameType === FRAME_TYPE_HEADER) {
         applyHeaderFrame(frame);
       } else if (frame.frameType === FRAME_TYPE_DATA) {
-        if (!transferState.headerReceived || transferState.totalPackets === null) {
+        const dataTransferId = transferIdToKey(frame.transferId);
+        const dataDecision = decideDataFrameHandling({
+          headerReceived: transferState.headerReceived,
+          activeTransferId: transferState.transferId,
+          totalPackets: transferState.totalPackets,
+          frameTransferId: dataTransferId,
+          packetIndex: frame.packetIndex,
+          hasPacket: transferState.receivedPackets.has(frame.packetIndex)
+        });
+
+        if (dataDecision === 'await-header') {
           logger.debug('[receiver] ignoring data frame before header');
           updateProgress();
           rafId = requestAnimationFrame(processFrame);
           return;
         }
-        const dataTransferId = transferIdToKey(frame.transferId);
-        if (dataTransferId !== transferState.transferId) {
+
+        if (dataDecision === 'wrong-transfer') {
           logger.debug('[receiver] ignoring data frame for non-active transfer', dataTransferId);
           rafId = requestAnimationFrame(processFrame);
           return;
         }
 
-        if (frame.packetIndex < 0 || frame.packetIndex >= transferState.totalPackets) {
+        if (dataDecision === 'out-of-range') {
           logger.debug('[receiver] ignoring out-of-range packet index', frame.packetIndex);
           rafId = requestAnimationFrame(processFrame);
           return;
         }
 
-        if (!transferState.receivedPackets.has(frame.packetIndex)) {
+        if (dataDecision === 'duplicate') {
+          logger.debug('[receiver] duplicate packet ignored', frame.packetIndex);
+        } else {
           transferState.receivedPackets.set(frame.packetIndex, frame.payload);
           lastUniquePacketAt = Date.now();
           endSeenAt = null;
-        } else {
-          logger.debug('[receiver] duplicate packet ignored', frame.packetIndex);
         }
 
         setStage('RECEIVING', 'Listening for packets...');

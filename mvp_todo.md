@@ -22,22 +22,22 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 ## 2) Protocol conformance (`HEADER` / `DATA` / `END`)
 
 ### 2.1 Frame fields
-- [ ] Add `transferId` to **DATA** frame type, assembly, and parsing.
+- [x] Add `transferId` to **DATA** frame type, assembly, and parsing.
 - [ ] Include/validate **protocol version** explicitly per frame format (current parser mostly relies on magic bytes).
-- [ ] Keep supported frame types exactly `HEADER`, `DATA`, `END` only.
+- [x] Keep supported frame types exactly `HEADER`, `DATA`, `END` only.
 
 ### 2.2 Transfer identity and lock isolation
-- [ ] Receiver must lock on first valid HEADER and then ignore all non-matching frames (including HEADER) until `SUCCESS`, `ERROR`, or manual reset.
-- [ ] Remove any behavior that auto-resets/merges when a different transfer is seen mid-attempt.
+- [x] Receiver must lock on first valid HEADER and then ignore all non-matching frames (including HEADER) until `SUCCESS`, `ERROR`, or manual reset.
+- [x] Remove any behavior that auto-resets/merges when a different transfer is seen mid-attempt.
 
 ### 2.3 Integrity
-- [ ] Preserve per-packet CRC32 validation for DATA.
-- [ ] Preserve full-file CRC32 validation after reassembly.
-- [ ] Ensure CRC failures are explicit user-visible error reasons (not silent).
+- [x] Preserve per-packet CRC32 validation for DATA.
+- [x] Preserve full-file CRC32 validation after reassembly.
+- [x] Ensure CRC failures are explicit user-visible error reasons (not silent).
 
 ### 2.4 Packet index validity
-- [ ] Explicitly ignore/reject DATA frames with index outside `0..totalPackets-1`.
-- [ ] Keep first valid payload for an index; duplicates must not overwrite.
+- [x] Explicitly ignore/reject DATA frames with index outside `0..totalPackets-1`.
+- [x] Keep first valid payload for an index; duplicates must not overwrite.
 
 ---
 
@@ -144,14 +144,14 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 ## 7) Required tests (must exist before MVP sign-off)
 
 ### 7.1 Protocol tests
-- [ ] HEADER roundtrip parse/assemble
-- [ ] DATA roundtrip parse/assemble
-- [ ] END roundtrip parse/assemble
-- [ ] DATA CRC32 mismatch rejected
+- [x] HEADER roundtrip parse/assemble
+- [x] DATA roundtrip parse/assemble
+- [x] END roundtrip parse/assemble
+- [x] DATA CRC32 mismatch rejected
 - [ ] full-file CRC32 mismatch rejected
-- [ ] wrong protocol magic/version rejected
-- [ ] `transferId` required and validated
-- [ ] DATA with wrong `transferId` ignored by receiver logic
+- [x] wrong protocol magic/version rejected
+- [x] `transferId` required and validated
+- [x] DATA with wrong `transferId` ignored by receiver logic
 
 ### 7.2 Sender tests
 - [ ] file > 1 MiB rejected
@@ -161,14 +161,14 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 
 ### 7.3 Receiver tests
 - [x] DATA before HEADER ignored
-- [ ] receiver locks to one `transferId`
-- [ ] wrong-transfer DATA ignored
-- [ ] duplicate DATA does not corrupt state
-- [ ] END with incomplete packet set becomes terminal failure
+- [x] receiver locks to one `transferId`
+- [x] wrong-transfer DATA ignored
+- [x] duplicate DATA does not corrupt state
+- [x] END with incomplete packet set becomes terminal failure
 - [x] no unique progress timeout becomes terminal failure
 - [ ] full packet set + matching CRC becomes success
-- [ ] out-of-range packet index handling verified
-- [ ] zero-byte file deterministic completion verified
+- [x] out-of-range packet index handling verified
+- [x] zero-byte file deterministic completion verified
 
 ---
 

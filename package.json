@@ -14,12 +14,14 @@
     "typecheck": "npm run typecheck --workspaces",
     "size:check": "npm run build --workspaces",
     "build:all": "npm run build -w protocol && npm run build -w sender && npm run build -w receiver",
-    "build:pages": "npm run build:all && node scripts/build-pages.mjs"
+    "build:pages": "npm run build:all && node scripts/build-pages.mjs",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.6",
     "typescript": "^5.9.2",
     "vite": "^5.4.10",
-    "vite-plugin-pwa": "^0.20.5"
+    "vite-plugin-pwa": "^0.20.5",
+    "vitest": "^4.0.18"
   }
 }
