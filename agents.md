@@ -111,3 +111,10 @@ The agent should implement or adhere to this logical structure:
 ---
 
 **Agent Note:** If you encounter ambiguity in the protocol, choose the option that maximizes **data integrity**. If a design choice adds complexity, propose a simpler alternative first.
+
+
+## 9. Release Defaults (Current)
+- Sender exposes a collapsible Settings panel with persisted localStorage values for frame duration, QR error correction, QR size, and chunk size (auto/manual).
+- Recommended defaults: `FRAME_DURATION_MS=2000`, `ErrorCorrection=H`, `QR Size=400`, `Chunk=Auto`, `REDUNDANCY_COUNT=3`.
+- Receiver includes scan alignment overlay, signal-loss warning (5s), and last-packet timestamp to improve field reliability.
+- Sender and receiver Vite configs use `base: './'` for GitHub Pages sub-path compatibility.
