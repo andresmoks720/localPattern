@@ -1,196 +1,446 @@
-# MVP Implementation TODO (Gap Analysis vs `mvp.md`)
+# MVPv2 TODO — Full Implementation Gap List (Deep Pass)
 
-This checklist compares the current codebase to `mvp.md` and lists the remaining work needed to fully implement the MVP spec.
+This file is a **comprehensive implementation checklist** against `mvp.md`.
+It is intentionally exhaustive so we do not miss hidden gaps.
 
-## 0) Priority order (recommended)
-1. **Protocol correctness first** (`transferId` in DATA, lock/isolation rules).
-2. **Receiver terminal behavior** (fixed timeouts + END-incomplete failure).
-3. **Protocol-as-library boundaries + typed message/state model**.
-4. **Sender hard limits + explicit state machine + error surfacing**.
-5. **Required tests** (protocol/sender/receiver + fake I/O harness).
-6. **UI copy alignment**.
+Legend:
+- `[x]` done / aligned
+- `[~]` partial / fragile / not fully enforced
+- `[ ]` missing
 
 ---
 
-## 1) Hard product limits
+## A. Product Mode & Scope Guardrails
 
-- [x] **Enforce sender hard cap at 1 MiB** (currently sender allows up to 10 MiB).
-- [x] **Show warning at > 512 KiB** with MVP wording (“Large files may take a very long time and may fail more often.” or equivalent).
-- [x] Ensure rejection happens **before packetization/transmission starts**.
-
----
-
-## 2) Protocol conformance (`HEADER` / `DATA` / `END`)
-
-### 2.0 Library boundary and documentation
-- [x] Keep protocol logic in library-ish modules, not scattered across UI handlers.
-- [x] Separate concerns clearly: frame parse/assemble, sender transport flow, receiver reassembly/state machine.
-- [x] Document message formats and valid state transitions in protocol docs/spec notes.
-
-### 2.1 Frame fields
-- [x] Add `transferId` to **DATA** frame type, assembly, and parsing.
-- [x] Include/validate **protocol version** explicitly per frame format (current parser mostly relies on magic bytes).
-- [x] Keep supported frame types exactly `HEADER`, `DATA`, `END` only.
-
-### 2.5 Typed messages and explicit error classes
-- [x] Use explicit typed message variants/classes for `HEADER` / `DATA` / `END` (avoid ad hoc boolean-driven shape checks).
-- [x] Introduce/keep explicit machine-readable protocol error categories/codes (not string-only errors).
-- [x] Ensure protocol/state logic branches on error codes, while UI maps codes to user copy.
-
-### 2.2 Transfer identity and lock isolation
-- [x] Receiver must lock on first valid HEADER and then ignore all non-matching frames (including HEADER) until `SUCCESS`, `ERROR`, or manual reset.
-- [x] Remove any behavior that auto-resets/merges when a different transfer is seen mid-attempt.
-
-### 2.3 Integrity
-- [x] Preserve per-packet CRC32 validation for DATA.
-- [x] Preserve full-file CRC32 validation after reassembly.
-- [x] Ensure CRC failures are explicit user-visible error reasons (not silent).
-
-### 2.4 Packet index validity
-- [x] Explicitly ignore/reject DATA frames with index outside `0..totalPackets-1`.
-- [x] Keep first valid payload for an index; duplicates must not overwrite.
+- [x] Receiver remains passive-only (no ACK/NACK sender control path).
+- [x] Transfer is one-way (`sender -> receiver`) in current runtime flow.
+- [x] No WebSocket/BLE/audio return channel implementation.
+- [x] No automatic resend-until-success loop.
+- [x] No multi-file queue/resume flow.
+- [~] Remove or gate MVPv2-incompatible reliability knobs (currently includes DATA redundancy multiplier).
+- [ ] Add explicit “MVPv2 one-way mode” guard in code/docs so future two-way code cannot leak into this flow.
+- [ ] Add static checks/tests ensuring no hidden dormant backchannel message types appear in protocol package.
 
 ---
 
-## 3) Sender behavior + state machine
+## B. Hard Product Limits
 
-### 3.1 Explicit sender states
-- [x] Implement explicit sender state machine with required states: `NO_FILE`, `READY`, `COUNTDOWN`, `TRANSMITTING`, `COMPLETE`, `ERROR` (optional `FILE_INVALID`).
-- [x] Replace loose booleans/timers with explicit state transitions.
+### B1. File size enforcement
+- [x] Sender rejects file > 1 MiB before transmit.
+- [x] Rejection is user-visible.
+- [~] File warning copy for >512 KiB should match spec wording exactly.
+- [ ] Add test asserting exact warning copy bucket for >512 KiB.
 
-### 3.2 Sender flow and one-pass mode
-- [x] Keep one-pass `HEADER -> DATA (ordered) -> END`.
-- [x] Keep no backchannel waiting, no automatic resend loop, no continuous HEADER/END looping.
-- [x] Keep stable final informational state after END (must not imply receiver success).
+### B2. One active transfer per receiver
+- [x] Receiver locks to first valid `HEADER.transferId`.
+- [x] Receiver ignores non-matching `DATA` after lock.
+- [x] Receiver ignores non-matching `END` after lock.
+- [x] Receiver ignores non-matching `HEADER` after lock.
+- [ ] Add explicit tests for non-matching `HEADER` ignore behavior until success/error/reset.
 
-### 3.3 Sender error handling (must be surfaced)
-- [x] Catch and surface **file read failures**.
-- [x] Catch and surface **packetization failures**.
-- [x] Catch and surface **too-many-packets / bounds failures**.
-- [x] Catch and surface **filename encoding limit failures**.
-- [x] Catch and surface **QR encode failures**.
-- [x] Catch and surface **finalize/render failures**.
-- [x] Ensure no unhandled promise rejections in sender workflow.
-
-### 3.4 Filename policy (reject-only)
-- [x] If filename cannot be encoded or exceeds protocol limits, fail with clear user-visible error.
-- [x] Do **not** silently truncate or mutate filename as fallback behavior.
+### B3. No late-join guarantee / no automatic recovery
+- [x] UI already tells users to restart sender on incomplete transfer.
+- [x] No retransmit request protocol present.
+- [ ] Remove redundancy scans in MVPv2 mode to avoid implicit recovery behavior.
 
 ---
 
-## 4) Receiver behavior + state machine
+## C. Protocol Architecture Boundary
 
-### 4.1 Explicit receiver states
-- [x] Ensure receiver uses required states exactly: `IDLE`, `SCANNING`, `RECEIVING`, `VERIFYING`, `SUCCESS`, `ERROR`.
-- [x] Make `ERROR` terminal for current attempt (no silent continued merging).
-
-### 4.2 Passive-only constraints
-- [x] Keep receiver fully passive: no ACK/NACK/requests and no assumptions sender can react.
-
-### 4.3 Ignorable frames vs terminal errors
-- [x] While scanning, treat these as ignorable (non-terminal):
-  - DATA before valid HEADER
-  - duplicate DATA for existing packet index
-  - non-matching `transferId` frames
-  - malformed/noise frames
-- [x] Reserve terminal `ERROR` for:
-  - camera failure
-  - END seen while incomplete after grace window
-  - no unique progress timeout
-  - reassembly/verification failures
-
-### 4.4 Completion semantics
-- [x] Complete only when all packet indices exist, reassembly succeeds, full-file CRC32 passes, and file size matches expected.
-- [x] END frame alone must never be treated as success.
-
-### 4.5 Fixed MVP timeout behavior
-- [x] Implement fixed END grace window: **2000 ms**.
-- [x] Implement fixed no-unique-progress timeout: **15000 ms**.
-- [x] Track `lastUniquePacketAt` and do not let duplicates extend timeout.
-- [x] On timeout/incomplete END, transition to terminal ERROR with actionable message.
-- [x] Do not depend on sender runtime settings (frame duration/redundancy) unless explicitly in protocol metadata.
-
-### 4.6 Post-failure behavior
-- [x] After terminal failure, keep explicit ERROR state until user restart/reset.
-- [x] Do not silently continue receiving into failed attempt.
-
-### 4.7 Zero-byte files
-- [x] Support zero-byte files with deterministic behavior (explicit success/failure path, no hangs).
-- [x] Add explicit sender behavior for zero-byte files (deterministic frame sequence and terminal state).
+- [x] Core frame assembly/parsing lives in `protocol` package.
+- [x] Receiver state machine is in protocol module, not in DOM.
+- [~] Sender transmission state logic is still UI-heavy in `sender/main.ts`.
+- [~] Receiver scan ingestion + UI state rendering is still tightly coupled in `receiver/main.ts`.
+- [ ] Extract sender transmission service module (preflight, stream scheduling, state transitions).
+- [ ] Extract receiver ingest service module (scanner ingress queue, dedupe strategy, machine events).
+- [ ] Add protocol transition/state docs outside view code.
 
 ---
 
-## 5) UI/UX copy alignment (minimal text changes)
+## D. Protocol Binary Contract (authoritative gaps)
 
-### Sender required messages
-- [x] No file selected
-- [x] File too large
-- [x] Ready to transmit
+### D1. Wire identity and type codes
+- [x] Magic bytes `QDB2` enforced.
+- [x] Legacy `QDB1` rejected.
+- [x] Frame type bytes map to HEADER/DATA/END constants.
+- [x] Big-endian unsigned reads/writes used via DataView.
+
+### D2. **Critical wire-layout mismatches to fix**
+- [ ] Remove extra protocol version byte from all frames.
+  - Current implementation encodes `magic|type|version|...`.
+  - Spec requires `magic|type|...` only.
+- [ ] Implement DATA `payloadLen(2)` field in wire format.
+- [ ] Parse DATA using explicit payloadLen and strict trailing-length validation.
+- [ ] Recompute frame offsets after version-byte removal.
+- [ ] Add strict parser rejection for malformed/trailing-bytes where layout is fixed.
+
+### D3. Required fields
+- [x] `transferId` required and length-checked (8 bytes).
+- [~] DATA required fields partially implied by current parser; must be explicit with `payloadLen`.
+- [x] HEADER includes fileName/fileSize/totalPackets/fileCrc32.
+- [x] END includes transferId.
+
+### D4. File name encoding constraints
+- [x] UTF-8 encoding in header assembly.
+- [x] uint16 filename length bounds enforced.
+- [x] No silent truncation.
+- [x] Sender surfaces filename limit errors.
+- [ ] Add tests for boundary filename byte lengths (`65535`, `65536`, multibyte UTF-8 edge cases).
+
+### D5. Packet/size bounds
+- [x] `totalPackets` uint16 bound checked.
+- [x] `packetIndex` uint16 encoded.
+- [x] `fileSize` uint32 encoded.
+- [~] Protocol-level max payload (`<=1024`) not enforced centrally.
+- [~] Protocol-level min DATA payload (`>=1`) not enforced via wire contract yet.
+- [~] `payloadLen` range cannot be validated until `payloadLen` field exists.
+- [ ] Add explicit invariant: `totalPackets=0` only when `fileSize=0`.
+- [ ] Add explicit invariant: non-empty file requires `totalPackets>=1`.
+
+---
+
+## E. CRC and Integrity Semantics
+
+### E1. Packet CRC coverage (critical mismatch)
+- [ ] Change packet CRC coverage to exactly: `transferId(8) + packetIndex(2) + payload(n)`.
+- [ ] Stop using payload-only CRC coverage in sender assembly.
+- [ ] Stop using payload-only CRC verification in parser.
+- [ ] Add fixture tests proving excluded bytes (`magic`,`type`,`payloadLen`) do not affect packet CRC.
+
+### E2. Full-file CRC
+- [x] Full-file CRC computed over reassembled bytes only.
+- [x] Receiver verifies full-file CRC before success.
+- [ ] Add tests confirming metadata changes do not influence full-file CRC validation.
+
+### E3. Integrity behavior
+- [x] Bad DATA packet CRC is ignorable (frame dropped, attempt continues).
+- [x] Full-file CRC mismatch is terminal error.
+- [ ] Add explicit error code mapping table for all integrity failures.
+
+---
+
+## F. Transfer Identity Rules
+
+- [x] transferId required on all frame types in types/api.
+- [x] Receiver lock to one active transfer implemented.
+- [ ] Add explicit terminal error on same-transferId conflicting HEADER metadata.
+- [ ] Add explicit tests for same-transferId metadata conflict cases (fileName, fileSize, totalPackets, fileCrc32).
+- [ ] Ensure repeated matching HEADER with same metadata is explicit no-op path.
+- [ ] Ensure repeated matching END is explicit no-op path.
+
+---
+
+## G. Zero-byte File Contract (critical mismatch)
+
+- [ ] `chunkFile` should emit `totalPackets=0` for empty file (currently forces at least one packet).
+- [ ] Sender should emit only `HEADER -> END` for empty file.
+- [ ] Sender must not emit DATA for empty files.
+- [ ] Receiver must not complete on HEADER alone when `totalPackets=0`.
+- [ ] Receiver should require END + zero-byte verification for success.
+- [ ] Add dedicated zero-byte protocol fixtures and regression tests.
+
+---
+
+## H. Sender Behavior vs Spec
+
+### H1. Core workflow
+- [x] File select -> size validation -> read bytes -> packetize -> start send exists.
+- [~] Precompute is present, but QR encoding is done per frame at runtime.
+- [ ] Add explicit preflight validation that **all required frame types** encode successfully before READY.
+- [ ] Fail before transmission when chosen settings cannot encode frames.
+
+### H2. Transmission mode
+- [x] One pass through current stream.
+- [~] DATA redundancy repeats frames (`redundancyCount`), deviates from strict `HEADER->DATA in order->END` once each.
+- [x] No backchannel waiting.
+- [x] No continuous auto-loop.
+
+### H3. Control-frame visibility rules (missing)
+- [ ] Guarantee HEADER visible >=2000ms before first DATA.
+- [ ] Guarantee END visible >=3000ms before non-QR completion screen.
+- [ ] Implement hold durations independent of general frameDuration setting.
+- [ ] Add tests with fake timers for HEADER/END hold semantics.
+
+### H4. Final screen sequencing
+- [~] END is shown as part of sequence, but explicit timed hold before completion is not guaranteed.
+- [ ] Enforce exact order: transmit END -> hold END -> then final non-QR screen.
+
+### H5. Interruption behavior
+- [x] Hidden tab interrupts active transmission.
+- [~] Copy mismatch (`Error: tab hidden...`) vs spec recommended copy.
+- [ ] Normalize interruption copy: `Transmission interrupted. Restart required.`
+
+### H6. Sender errors
+- [x] User-visible handling for file read failure.
+- [x] Packetization failure surfaced.
+- [x] Too-many-packets surfaced.
+- [x] Filename limit issues surfaced.
+- [x] QR encode failure surfaced.
+- [~] Explicit “frame precompute failure” bucket not distinguished.
+- [~] Explicit “invalid preflight settings” bucket not distinguished.
+- [ ] Add complete error-code -> user-copy map and assert in tests.
+
+### H7. Abort/reset lifecycle
+- [x] Clears timers/timeouts.
+- [x] Clears transfer arrays/state on reset.
+- [x] Releases wake lock.
+- [ ] Add tests proving no stale frame cache leaks across attempts.
+- [ ] If pre-rendered assets are introduced, ensure explicit cleanup.
+
+### H8. Manual retry semantics
+- [x] Retry rebuilds frames and generates fresh transferId.
+- [ ] Add deterministic test asserting transferId changes across retries of same file.
+
+---
+
+## I. Receiver Behavior vs Spec
+
+### I1. Workflow states
+- [x] Has `IDLE/SCANNING/RECEIVING/VERIFYING/SUCCESS/ERROR` states.
+- [x] Error is terminal until reset.
+
+### I2. Packet handling
+- [x] DATA before HEADER ignored.
+- [x] Wrong transfer frames ignored after lock.
+- [x] Duplicate DATA accepted once and deduped.
+- [x] Out-of-range packetIndex ignored.
+- [x] CRC-invalid DATA ignored without terminal failure.
+
+### I3. Completion rule (major gap)
+- [ ] Require END as part of success condition.
+- [x] Full packet set + file reassembly + CRC + file size currently required.
+- [ ] For zero-byte case, wait for END before success.
+
+### I4. Failure rules
+- [x] END-incomplete grace timeout implemented (2000ms).
+- [x] No-unique-progress timeout implemented (15000ms).
+- [x] Duplicate packets do not reset unique-progress timer.
+- [~] Timeout copy should match spec exactly for incomplete transfer bucket.
+
+### I5. Scanner dedupe vs protocol dedupe
+- [~] Scanner ingress dedupe currently implemented with `lastDecodedPayload` equality only.
+- [ ] Make scanner dedupe bounded-time/noise-oriented (not unbounded “last payload forever”).
+- [ ] Keep protocol dedupe independent and explicitly tested.
+- [ ] Add tests showing protocol correctness unaffected when scanner dedupe is disabled.
+
+### I6. Queue/ingest discipline
+- [~] Ingestion is single callback path today, but lacks explicit queue abstraction.
+- [ ] Introduce serialized ingest queue/channel to avoid concurrent state mutation risks.
+- [ ] Add tests for deterministic ordering under burst scanner callbacks.
+
+### I7. Camera/scanner UX
+- [x] Prefers rear camera.
+- [ ] Add explicit camera selection fallback UI if preferred camera fails.
+- [x] Stable scan overlay exists.
+- [ ] Add readiness checks based on media readiness events with robust fallback handling.
+
+### I8. After failure
+- [x] ERROR stops protocol ingestion for attempt.
+- [x] User reset/restart path exists.
+- [ ] Add tests for “terminal ERROR blocks further frames” across all error classes.
+
+---
+
+## J. State Machine Discipline
+
+### J1. Sender
+- [x] Required sender states exist in type.
+- [~] Transitions are not centralized in a single reducer/table.
+- [ ] Create explicit transition map + guard checks.
+- [ ] Add transition tests (valid transitions and forbidden transitions).
+
+### J2. Receiver
+- [x] Required receiver states exist in machine.
+- [~] Transition invariants are implicit in methods.
+- [ ] Add explicit transition table docs/tests.
+- [ ] Add reset transition tests proving cleanup and fresh-attempt behavior.
+
+---
+
+## K. UI/UX Required Copy and Guidance
+
+### K1. Sender required copy buckets
+- [x] No file selected.
+- [x] File too large.
+- [x] Ready to transmit.
 - [x] Starting in…
-- [x] Sending packet X / N
-- [x] Transmission finished
-- [x] Error with actionable reason
+- [x] Sending packet X/N.
+- [x] Transmission finished.
+- [~] Actionable error copy present but not fully normalized to spec buckets.
 
-### Receiver required messages
-- [x] Ready to scan
-- [x] Waiting for header
-- [x] Receiving packets
-- [x] Verifying
-- [x] File ready
-- [x] Transfer incomplete, restart sender
-- [x] Decode error / camera error / corruption error
+### K2. Receiver required copy buckets
+- [x] Ready to scan.
+- [x] Waiting for header.
+- [x] Receiving packets.
+- [x] Verifying.
+- [x] File ready.
+- [x] Transfer incomplete, restart sender.
+- [x] Decode/camera/corruption error buckets present.
+- [ ] Normalize all timeout/incomplete copy exactly per spec recommendation where practical.
 
-### Copy quality
-- [x] Keep reason-specific wording (no vague catch-all errors).
+### K3. Operator guidance
+- [~] Some practical hints exist.
+- [ ] Ensure all key hints appear in concise form: steady devices, QR fully visible, move closer, fullscreen mode, larger files slower.
 
----
-
-## 6) Out-of-scope cleanup / guardrails
-
-- [x] Verify no out-of-scope recovery features are added (ACK/NACK, auto resend-until-success, loop mode, etc.).
-- [x] Keep single active transfer only.
-- [x] Keep implementation minimal and avoid architecture/framework rewrites.
-
----
-
-## 7) Required tests (must exist before MVP sign-off)
-
-### 7.0 Test harness / fake I/O
-- [x] Add/maintain core tests using fake reader/writer I/O abstractions for transfer logic.
-- [x] Ensure protocol/state-machine correctness is validated without camera/scanner/QR renderer.
-- [x] Keep scanner/renderer tests separate from core protocol tests.
-
-### 7.1 Protocol tests
-- [x] HEADER roundtrip parse/assemble
-- [x] DATA roundtrip parse/assemble
-- [x] END roundtrip parse/assemble
-- [x] DATA CRC32 mismatch rejected
-- [x] full-file CRC32 mismatch rejected
-- [x] wrong protocol magic/version rejected
-- [x] `transferId` required and validated
-- [x] DATA with wrong `transferId` ignored by receiver logic
-- [x] structured protocol error codes are emitted for representative failures
-
-### 7.2 Sender tests
-- [x] file > 1 MiB rejected
-- [x] file read failure becomes user-visible error
-- [x] packetization failure becomes user-visible error
-- [x] QR encode failure becomes user-visible error
-
-### 7.3 Receiver tests
-- [x] DATA before HEADER ignored
-- [x] receiver locks to one `transferId`
-- [x] wrong-transfer DATA ignored
-- [x] duplicate DATA does not corrupt state
-- [x] END with incomplete packet set becomes terminal failure
-- [x] no unique progress timeout becomes terminal failure
-- [x] full packet set + matching CRC becomes success
-- [x] out-of-range packet index handling verified
-- [x] zero-byte file deterministic completion verified
-- [x] session identity (`transferId`) is required in all frame types and enforced through full receive lifecycle
+### K4. Stable visual geometry
+- [~] QR and scan overlays are generally stable/square.
+- [ ] Audit CSS/layout to guarantee no transfer-time layout shifts.
+- [ ] Add smoke test or visual regression check for stable QR area during transmission.
 
 ---
 
-## 8) Definition of done for this TODO
+## L. Reliability Definition Alignment
 
-MVP is done when all checklist items above are complete and the acceptance criteria in `mvp.md` are demonstrably true in code + tests.
+- [x] Correct packets accepted.
+- [x] Corrupted packets rejected.
+- [x] Wrong-transfer packets ignored.
+- [x] Completed files verified.
+- [x] Incomplete transfers timeout clearly.
+- [x] Manual retry possible.
+- [ ] Remove/limit any behavior implying guaranteed recovery (redundancy setting in MVPv2 one-way mode).
+
+---
+
+## M. Resource Lifecycle Rules
+
+### M1. Sender cleanup
+- [x] Clears timers/timeouts and active transfer state.
+- [x] Clears progress/UI state on reset.
+- [x] Releases wake lock resource.
+- [ ] If frame caching is added, explicitly clear cache on reset/new attempt/teardown.
+
+### M2. Receiver cleanup
+- [x] Stops camera tracks.
+- [x] Clears raf/interval timers.
+- [x] Clears packet store and transferId via machine reset.
+- [x] Clears download Blob URL.
+- [ ] Add explicit cleanup for attempt diagnostics/counters if introduced.
+
+---
+
+## N. Dependency, Packaging, and Transport Rules
+
+- [x] No remote CDN dependency in runtime path.
+- [x] Browser-only static app packaging via Vite.
+- [x] Byte-oriented payload path in protocol.
+- [~] Sender still wraps binary frame bytes in base64 text for QR payload transport.
+- [ ] Reconcile anti-pattern clause (“Base64/Data-URL-as-core-payload architecture”) with implementation approach; either adjust implementation or clarify bounded QR text transport policy in spec/docs.
+
+---
+
+## O. Observability (minimal)
+
+- [x] Receiver exposes total scans + unique packet count UI.
+- [~] Missing explicit counters for foreign frames, malformed/noise frames, bad-packet-CRC ignores, finalize duration.
+- [ ] Add minimal diagnostic counters in core services (not complex dashboard).
+- [ ] Expose event hooks from sender/receiver core: frame rendered, frame accepted, complete, failed.
+
+---
+
+## P. Required Testing Before Sign-off (full matrix)
+
+### P1. Protocol unit tests
+- [x] HEADER/DATA/END roundtrip tests exist.
+- [ ] Exact byte-layout conformance tests (all offsets/lengths).
+- [ ] Wrong-magic/version compatibility tests aligned with final wire contract.
+- [ ] transferId required/validated tests across all frame types.
+- [ ] DATA payloadLen bounds + exact length matching tests.
+- [ ] totalPackets/fileSize invariants tests.
+- [ ] packet CRC coverage tests (transferId+index+payload only).
+- [ ] full-file CRC coverage tests (file bytes only).
+- [ ] repeated matching HEADER/END behavior tests.
+- [ ] conflicting same-transfer HEADER metadata terminal error tests.
+- [ ] END-before-HEADER ignored tests.
+- [ ] zero-byte wire contract tests.
+
+### P2. Sender tests
+- [x] >1 MiB rejected.
+- [x] file-read failure surfaced.
+- [x] packetization failure surfaced.
+- [x] QR encode failure surfaced.
+- [ ] frame precompute failure surfaced.
+- [ ] filename encoding limit boundary tests.
+- [ ] preflight settings validation tests.
+- [ ] estimated transfer duration presence test.
+- [ ] HEADER/END hold duration tests.
+- [ ] hidden/interrupted transmission restart-required tests.
+- [ ] reset cleanup and no stale state tests.
+- [ ] manual retry new transferId test.
+
+### P3. Receiver tests
+- [x] DATA-before-HEADER ignored.
+- [x] lock-to-one-transfer behavior.
+- [x] duplicate DATA handling.
+- [x] out-of-range index ignored.
+- [x] bad DATA CRC ignored.
+- [x] END-incomplete timeout path.
+- [x] no-progress timeout path.
+- [x] full-set + CRC success path.
+- [ ] success requires END test.
+- [ ] zero-byte waits for END test.
+- [ ] conflicting-header terminal error test.
+- [ ] repeated matching control-frame no-op tests.
+- [ ] terminal ERROR blocks further ingestion tests (broad coverage).
+- [ ] scanner-ingress dedupe vs protocol dedupe separation tests.
+
+### P4. Empty-file dedicated coverage
+- [ ] Sender emits deterministic HEADER->END only.
+- [ ] Receiver deterministic zero-byte verify success/failure reasons.
+- [ ] No hang waiting for missing DATA.
+
+### P5. Manual real-device matrix (recording required)
+- [ ] phone->phone
+- [ ] laptop->phone
+- [ ] bright/low light
+- [ ] portrait/landscape
+- [ ] fullscreen on/off
+- [ ] near max recommended size
+- [ ] zero-byte file
+- [ ] restart after incomplete failure
+- [ ] wrong-transfer background frames
+
+### P6. CI hygiene
+- [ ] Fail CI on `test.only`.
+- [ ] Fail CI on unhandled promise rejections.
+
+---
+
+## Q. Known correctness bugs observed in current code audit
+
+- [ ] Remove duplicate `receiverMachine.startScanning()` invocation in receiver reset helper.
+- [ ] Replace parser assumptions that conflict with spec wire layout.
+- [ ] Tighten malformed-frame handling to distinguish ignorable noise vs protocol faults consistently.
+
+---
+
+## R. Acceptance Criteria Tracker (must all be true)
+
+- [x] Sender rejects files above 1 MiB.
+- [x] Receiver passive-only.
+- [~] transferId in all frames implemented, but wire layout differs from spec due to extra version byte.
+- [ ] Exact frame byte layout implemented.
+- [ ] CRC coverage implemented exactly as specified.
+- [x] Receiver ignores wrong-transfer frames once locked.
+- [x] Bad packet CRC treated as ignorable frame loss.
+- [x] full-file CRC verified.
+- [x] fixed timeout windows implemented.
+- [~] sender exception buckets mostly covered; precompute/preflight bucket incomplete.
+- [ ] preflight settings validation before transmission is complete.
+- [~] receiver success currently does not require END.
+- [ ] zero-byte path deterministic per spec.
+- [x] manual retry fresh attempt behavior mostly present.
+- [~] QR visual stability mostly present; needs explicit guarantees/tests.
+- [x] sender interruption hidden-page behavior stops transfer.
+- [~] core transport/state partly testable outside UI; sender/receiver app files still too orchestration-heavy.
+- [x] no major out-of-scope features added.
+
+---
+
+## S. Execution Order (high confidence)
+
+1. **Protocol blockers first**: wire layout, payloadLen, CRC coverage, zero-byte invariants.
+2. **Receiver correctness**: END-required success, conflicting-header terminal errors, dedupe separation.
+3. **Sender correctness**: preflight QR validation, control-frame holds, remove redundancy in MVPv2 mode.
+4. **Tests + CI**: add exhaustive protocol/sender/receiver tests and hygiene guards.
+5. **Boundary hardening**: split service/state logic from UI and document transitions.
+
