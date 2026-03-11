@@ -86,3 +86,9 @@ npm run typecheck
 npm run build:all
 npm run build:pages
 ```
+
+## Release Verification Record
+- Detailed cross-browser, file-type, stress, and offline verification matrix: [`docs/release-verification.md`](docs/release-verification.md)
+
+## Pre-Release Checklist
+- [ ] Re-run the release verification matrix in `docs/release-verification.md` before tagging a release.
