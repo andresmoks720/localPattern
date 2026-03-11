@@ -12,7 +12,9 @@
     "dev:sender": "npm run dev -w sender",
     "dev:receiver": "npm run dev -w receiver",
     "typecheck": "npm run typecheck --workspaces",
-    "size:check": "npm run build --workspaces"
+    "size:check": "npm run build --workspaces",
+    "build:all": "npm run build -w protocol && npm run build -w sender && npm run build -w receiver",
+    "build:pages": "npm run build:all && node scripts/build-pages.mjs"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.6",

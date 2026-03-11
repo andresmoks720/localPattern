@@ -1,7 +1,10 @@
 import { calculateCRC32 } from './crc32';
-import { CHECKSUM_SIZE, HEADER_SIZE, MAGIC_BYTES, PROTOCOL_VERSION, type Packet } from './types';
+import { BASE_HEADER_SIZE, CHECKSUM_SIZE, MAGIC_BYTES, PROTOCOL_VERSION, type ChunkFileOptions, type Packet } from './types';
 
 export const DEFAULT_MAX_PAYLOAD_SIZE = 512;
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 function assertUint16(value: number, fieldName: string): void {
   if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
@@ -9,11 +12,20 @@ function assertUint16(value: number, fieldName: string): void {
   }
 }
 
+function fileNameBytes(fileName: string): Uint8Array {
+  const encoded = textEncoder.encode(fileName.trim() || 'unnamed.bin');
+  if (encoded.length > 0xff) {
+    throw new Error('fileName must be <= 255 UTF-8 bytes.');
+  }
+  return encoded;
+}
+
 function packetHeaderBytes(packet: Omit<Packet, 'packetChecksum'>): Uint8Array {
   assertUint16(packet.totalPackets, 'totalPackets');
   assertUint16(packet.packetIndex, 'packetIndex');
 
-  const headerAndPayload = new Uint8Array(HEADER_SIZE + packet.payload.length);
+  const encodedFileName = fileNameBytes(packet.fileName);
+  const headerAndPayload = new Uint8Array(BASE_HEADER_SIZE + encodedFileName.length + packet.payload.length);
   const view = new DataView(headerAndPayload.buffer, headerAndPayload.byteOffset, headerAndPayload.byteLength);
 
   headerAndPayload.set(MAGIC_BYTES, 0);
@@ -21,7 +33,9 @@ function packetHeaderBytes(packet: Omit<Packet, 'packetChecksum'>): Uint8Array {
   view.setUint32(5, packet.fileHash);
   view.setUint16(9, packet.totalPackets);
   view.setUint16(11, packet.packetIndex);
-  headerAndPayload.set(packet.payload, HEADER_SIZE);
+  view.setUint8(13, encodedFileName.length);
+  headerAndPayload.set(encodedFileName, BASE_HEADER_SIZE);
+  headerAndPayload.set(packet.payload, BASE_HEADER_SIZE + encodedFileName.length);
 
   return headerAndPayload;
 }
@@ -44,7 +58,7 @@ export function assemblePacket(packet: Packet): Uint8Array {
 }
 
 export function parsePacket(packetBytes: Uint8Array): Packet {
-  if (packetBytes.length < HEADER_SIZE + CHECKSUM_SIZE) {
+  if (packetBytes.length < BASE_HEADER_SIZE + CHECKSUM_SIZE) {
     throw new Error('Packet is too small.');
   }
 
@@ -62,14 +76,25 @@ export function parsePacket(packetBytes: Uint8Array): Packet {
   const fileHash = view.getUint32(5);
   const totalPackets = view.getUint16(9);
   const packetIndex = view.getUint16(11);
-  const payload = packetBytes.slice(HEADER_SIZE, packetBytes.length - CHECKSUM_SIZE);
-  const packetChecksum = view.getUint32(packetBytes.length - CHECKSUM_SIZE);
+  const fileNameLength = view.getUint8(13);
+
+  const payloadStart = BASE_HEADER_SIZE + fileNameLength;
+  const payloadEnd = packetBytes.length - CHECKSUM_SIZE;
+
+  if (payloadStart > payloadEnd) {
+    throw new Error('Malformed packet payload offsets.');
+  }
+
+  const fileName = textDecoder.decode(packetBytes.slice(BASE_HEADER_SIZE, payloadStart));
+  const payload = packetBytes.slice(payloadStart, payloadEnd);
+  const packetChecksum = view.getUint32(payloadEnd);
 
   const packet: Packet = {
     version,
     fileHash,
     totalPackets,
     packetIndex,
+    fileName,
     payload,
     packetChecksum
   };
@@ -86,11 +111,13 @@ export function parsePacket(packetBytes: Uint8Array): Packet {
   return packet;
 }
 
-export function chunkFile(file: Uint8Array, maxPayloadSize = DEFAULT_MAX_PAYLOAD_SIZE): Packet[] {
+export function chunkFile(file: Uint8Array, options: ChunkFileOptions = {}): Packet[] {
+  const maxPayloadSize = options.maxPayloadSize ?? DEFAULT_MAX_PAYLOAD_SIZE;
   if (maxPayloadSize <= 0 || !Number.isInteger(maxPayloadSize)) {
     throw new Error('maxPayloadSize must be a positive integer.');
   }
 
+  const normalizedFileName = options.fileName?.trim() || 'unnamed.bin';
   const fileHash = calculateCRC32(file);
   const totalPackets = Math.max(1, Math.ceil(file.length / maxPayloadSize));
   assertUint16(totalPackets, 'totalPackets');
@@ -107,6 +134,7 @@ export function chunkFile(file: Uint8Array, maxPayloadSize = DEFAULT_MAX_PAYLOAD
       fileHash,
       totalPackets,
       packetIndex,
+      fileName: normalizedFileName,
       payload
     };
 
