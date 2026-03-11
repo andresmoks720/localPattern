@@ -1,0 +1,211 @@
+import { calculateCRC32 } from './crc32';
+import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferDataFrame, type TransferEndFrame, type TransferFrame, type TransferHeaderFrame } from './types';
+
+export const RECEIVER_TIMEOUTS = {
+  END_GRACE_MS: 2000,
+  NO_UNIQUE_PROGRESS_TIMEOUT_MS: 15000
+} as const;
+
+export type ReceiverState = 'IDLE' | 'SCANNING' | 'RECEIVING' | 'VERIFYING' | 'SUCCESS' | 'ERROR';
+
+export const RECEIVER_ERROR_CODES = {
+  END_INCOMPLETE: 'END_INCOMPLETE',
+  NO_PROGRESS_TIMEOUT: 'NO_PROGRESS_TIMEOUT',
+  MISSING_PACKET: 'MISSING_PACKET',
+  FILE_CRC_MISMATCH: 'FILE_CRC_MISMATCH',
+  FILE_SIZE_MISMATCH: 'FILE_SIZE_MISMATCH'
+} as const;
+
+export type ReceiverErrorCode = (typeof RECEIVER_ERROR_CODES)[keyof typeof RECEIVER_ERROR_CODES];
+
+export interface ReceiverMachineError {
+  code: ReceiverErrorCode;
+  message: string;
+}
+
+export interface ReceiverSnapshot {
+  state: ReceiverState;
+  transferId: string | null;
+  fileName: string;
+  expectedFileSize: number | null;
+  totalPackets: number | null;
+  fileCrc32: number | null;
+  receivedCount: number;
+  totalScans: number;
+  lastUniquePacketAt: number | null;
+  endSeenAt: number | null;
+  fileBytes?: Uint8Array;
+  error?: ReceiverMachineError;
+}
+
+function transferIdToKey(transferId: Uint8Array): string {
+  return Array.from(transferId).map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+export class ReceiverMachine {
+  private snapshotValue: ReceiverSnapshot = {
+    state: 'IDLE',
+    transferId: null,
+    fileName: '',
+    expectedFileSize: null,
+    totalPackets: null,
+    fileCrc32: null,
+    receivedCount: 0,
+    totalScans: 0,
+    lastUniquePacketAt: null,
+    endSeenAt: null
+  };
+
+  private readonly receivedPackets = new Map<number, Uint8Array>();
+
+  public startScanning(): void {
+    this.reset();
+    this.snapshotValue.state = 'SCANNING';
+  }
+
+  public reset(): void {
+    this.snapshotValue = {
+      state: 'IDLE',
+      transferId: null,
+      fileName: '',
+      expectedFileSize: null,
+      totalPackets: null,
+      fileCrc32: null,
+      receivedCount: 0,
+      totalScans: 0,
+      lastUniquePacketAt: null,
+      endSeenAt: null
+    };
+    this.receivedPackets.clear();
+  }
+
+  public get snapshot(): ReceiverSnapshot {
+    return { ...this.snapshotValue };
+  }
+
+  public applyFrame(frame: TransferFrame, now: number): ReceiverSnapshot {
+    if (this.snapshotValue.state === 'ERROR' || this.snapshotValue.state === 'SUCCESS') {
+      return this.snapshot;
+    }
+
+    this.snapshotValue.totalScans += 1;
+
+    if (frame.frameType === FRAME_TYPE_HEADER) {
+      this.applyHeader(frame, now);
+      return this.evaluateCompletion();
+    }
+    if (frame.frameType === FRAME_TYPE_DATA) {
+      this.applyData(frame, now);
+      return this.evaluateCompletion();
+    }
+    if (frame.frameType === FRAME_TYPE_END) {
+      this.applyEnd(frame, now);
+      return this.evaluateCompletion();
+    }
+    return this.snapshot;
+  }
+
+  public tick(now: number): ReceiverSnapshot {
+    if (this.snapshotValue.state !== 'SCANNING' && this.snapshotValue.state !== 'RECEIVING') {
+      return this.snapshot;
+    }
+
+    if (
+      this.snapshotValue.transferId
+      && this.snapshotValue.lastUniquePacketAt !== null
+      && now - this.snapshotValue.lastUniquePacketAt > RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS
+    ) {
+      return this.fail(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT, 'No new unique packets for 15 seconds.');
+    }
+
+    if (
+      this.snapshotValue.transferId
+      && this.snapshotValue.endSeenAt !== null
+      && this.snapshotValue.totalPackets !== null
+      && this.receivedPackets.size < this.snapshotValue.totalPackets
+      && now - this.snapshotValue.endSeenAt > RECEIVER_TIMEOUTS.END_GRACE_MS
+    ) {
+      return this.fail(RECEIVER_ERROR_CODES.END_INCOMPLETE, 'END frame seen before all packets were received.');
+    }
+
+    return this.snapshot;
+  }
+
+  private applyHeader(frame: TransferHeaderFrame, now: number): void {
+    const incomingTransferId = transferIdToKey(frame.transferId);
+    if (this.snapshotValue.transferId && this.snapshotValue.transferId !== incomingTransferId) {
+      return;
+    }
+
+    this.snapshotValue.transferId = incomingTransferId;
+    this.snapshotValue.fileName = frame.fileName || 'received.bin';
+    this.snapshotValue.expectedFileSize = frame.fileSize;
+    this.snapshotValue.totalPackets = frame.totalPackets;
+    this.snapshotValue.fileCrc32 = frame.fileCrc32;
+    this.snapshotValue.lastUniquePacketAt = this.snapshotValue.lastUniquePacketAt ?? now;
+    this.snapshotValue.state = 'RECEIVING';
+  }
+
+  private applyData(frame: TransferDataFrame, now: number): void {
+    if (!this.snapshotValue.transferId || this.snapshotValue.totalPackets === null) return;
+    if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
+    if (frame.packetIndex < 0 || frame.packetIndex >= this.snapshotValue.totalPackets) return;
+    if (this.receivedPackets.has(frame.packetIndex)) return;
+
+    this.receivedPackets.set(frame.packetIndex, frame.payload);
+    this.snapshotValue.receivedCount = this.receivedPackets.size;
+    this.snapshotValue.lastUniquePacketAt = now;
+  }
+
+  private applyEnd(frame: TransferEndFrame, now: number): void {
+    if (!this.snapshotValue.transferId) return;
+    if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
+    this.snapshotValue.endSeenAt = now;
+  }
+
+  private evaluateCompletion(): ReceiverSnapshot {
+    if (this.snapshotValue.totalPackets === null || this.snapshotValue.fileCrc32 === null) {
+      return this.snapshot;
+    }
+
+    if (this.receivedPackets.size !== this.snapshotValue.totalPackets) {
+      return this.snapshot;
+    }
+
+    this.snapshotValue.state = 'VERIFYING';
+    const ordered: Uint8Array[] = [];
+    for (let i = 0; i < this.snapshotValue.totalPackets; i += 1) {
+      const packet = this.receivedPackets.get(i);
+      if (!packet) {
+        return this.fail(RECEIVER_ERROR_CODES.MISSING_PACKET, 'Missing packets detected during verification.');
+      }
+      ordered.push(packet);
+    }
+
+    const totalLength = ordered.reduce((sum, packet) => sum + packet.length, 0);
+    const fileBytes = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const packet of ordered) {
+      fileBytes.set(packet, offset);
+      offset += packet.length;
+    }
+
+    if (calculateCRC32(fileBytes) !== this.snapshotValue.fileCrc32) {
+      return this.fail(RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH, 'File CRC32 mismatch detected.');
+    }
+
+    if (this.snapshotValue.expectedFileSize !== null && fileBytes.length !== this.snapshotValue.expectedFileSize) {
+      return this.fail(RECEIVER_ERROR_CODES.FILE_SIZE_MISMATCH, 'File size mismatch detected during verification.');
+    }
+
+    this.snapshotValue.state = 'SUCCESS';
+    this.snapshotValue.fileBytes = fileBytes;
+    return this.snapshot;
+  }
+
+  private fail(code: ReceiverErrorCode, message: string): ReceiverSnapshot {
+    this.snapshotValue.state = 'ERROR';
+    this.snapshotValue.error = { code, message };
+    return this.snapshot;
+  }
+}

@@ -1,12 +1,15 @@
 import './style.css';
 import jsQR from 'jsqr';
-import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, calculateCRC32, parseFrame, type TransferHeaderFrame } from '@qr-data-bridge/protocol';
+import {
+  parseFrame,
+  ReceiverMachine,
+  RECEIVER_ERROR_CODES,
+  type ReceiverSnapshot
+} from '@qr-data-bridge/protocol';
 
 const QR_PREFIX = 'QDB64:';
 const SCAN_INTERVAL_MS = 300;
 const SIGNAL_LOST_MS = 5000;
-const END_GRACE_MS = 2000;
-const NO_UNIQUE_PROGRESS_TIMEOUT_MS = 15000;
 const THEME_KEY = 'qdb_theme';
 
 const logger = {
@@ -20,21 +23,6 @@ const logger = {
 
 let sharedAudioContext: AudioContext | null = null;
 
-type ReceiverStage = 'IDLE' | 'SCANNING' | 'RECEIVING' | 'VERIFYING' | 'SUCCESS' | 'ERROR';
-
-interface TransferState {
-  transferId: string | null;
-  totalPackets: number | null;
-  expectedFileSize: number | null;
-  receivedPackets: Map<number, Uint8Array>;
-  fileCrc32: number | null;
-  fileName: string;
-  totalScans: number;
-  headerReceived: boolean;
-  lastUniquePacketAt: number | null;
-  endSeenAt: number | null;
-}
-
 function base64ToBytes(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -46,38 +34,6 @@ function getElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) throw new Error(`Element not found: ${selector}`);
   return element;
-}
-
-function createTransferState(): TransferState {
-  return {
-    transferId: null,
-    totalPackets: null,
-    expectedFileSize: null,
-    receivedPackets: new Map<number, Uint8Array>(),
-    fileCrc32: null,
-    fileName: '',
-    totalScans: 0,
-    headerReceived: false,
-    lastUniquePacketAt: null,
-    endSeenAt: null
-  };
-}
-
-function concatPayloads(payloads: Uint8Array[]): Uint8Array {
-  const totalLength = payloads.reduce((sum, p) => sum + p.length, 0);
-  const out = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const p of payloads) {
-    out.set(p, offset);
-    offset += p.length;
-  }
-  return out;
-}
-
-function transferIdToKey(transferId: Uint8Array): string {
-  return Array.from(transferId)
-    .map((value) => value.toString(16).padStart(2, '0'))
-    .join('');
 }
 
 function getAudioContext(): AudioContext {
@@ -131,7 +87,7 @@ app.innerHTML = `
     <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Completion sound</label>
     <div id="status" class="status">Ready to scan</div>
     <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
-    <div id="progress-text">Waiting for header...</div>
+    <div id="progress-text">Waiting for header</div>
     <div id="scan-stats">Received 0 scans → 0 unique packets</div>
     <div id="last-received-time">Last packet: -</div>
     <div id="warning" class="warning"></div>
@@ -167,27 +123,15 @@ let lastDecodedPayload = '';
 let lastScanAt = 0;
 let scanStartedAt = 0;
 let lastPacketAt = 0;
-let transferState = createTransferState();
 let downloadUrl: string | null = null;
 let soundEnabled = false;
+let successSoundPlayed = false;
+
+const receiverMachine = new ReceiverMachine();
 
 function setTheme(theme: 'dark' | 'light'): void {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem(THEME_KEY, theme);
-}
-
-function setStage(stage: ReceiverStage, message: string): void {
-  panel.dataset.state = stage;
-  statusEl.textContent = message;
-}
-
-function updateProgress(): void {
-  const total = transferState.totalPackets ?? 0;
-  const received = transferState.receivedPackets.size;
-  const pct = transferState.headerReceived && total > 0 ? Math.floor((received / total) * 100) : 0;
-  progressBar.style.width = `${pct}%`;
-  progressText.textContent = transferState.headerReceived ? `Receiving packets: ${received}/${total} (${pct}%)` : 'Waiting for header';
-  scanStatsEl.textContent = `Received ${transferState.totalScans} scans → ${received} unique packets`;
 }
 
 function revokeDownloadUrl(): void {
@@ -203,87 +147,7 @@ function stopCameraStream(): void {
   video.srcObject = null;
 }
 
-function resetTransferState(clearWarning = true): void {
-  transferState = createTransferState();
-  if (clearWarning) warningEl.textContent = '';
-  updateProgress();
-  revokeDownloadUrl();
-  downloadButton.disabled = true;
-  lastPacketAt = 0;
-  lastReceivedTimeEl.textContent = 'Last packet: -';
-}
-
-function applyHeaderFrame(header: TransferHeaderFrame): void {
-  const incomingTransferId = transferIdToKey(header.transferId);
-  if (transferState.headerReceived && transferState.transferId && transferState.transferId !== incomingTransferId) {
-    logger.debug('[receiver] ignoring non-matching header while locked');
-    return;
-  }
-
-  transferState.headerReceived = true;
-  transferState.transferId = incomingTransferId;
-  transferState.fileName = header.fileName || 'received.bin';
-  transferState.expectedFileSize = header.fileSize;
-  transferState.totalPackets = header.totalPackets;
-  transferState.fileCrc32 = header.fileCrc32;
-  setStage('RECEIVING', 'Receiving packets');
-  lastPacketEl.textContent = `${transferState.fileName} • ${header.fileSize} bytes • ${header.totalPackets} packets`;
-}
-
-async function finalizeTransfer(): Promise<void> {
-  if (transferState.totalPackets === null || transferState.fileCrc32 === null) return;
-  setStage('VERIFYING', 'Verifying...');
-
-  const ordered: Uint8Array[] = [];
-  for (let i = 0; i < transferState.totalPackets; i += 1) {
-    const payload = transferState.receivedPackets.get(i);
-    if (!payload) {
-      failTransfer('Transfer incomplete, restart sender', 'Missing packets detected during verification. Please restart sender.');
-      return;
-    }
-    ordered.push(payload);
-  }
-
-  const fileBytes = concatPayloads(ordered);
-  const computedCrc = calculateCRC32(fileBytes);
-  if (computedCrc !== transferState.fileCrc32) {
-    failTransfer('Decode error', 'File CRC32 mismatch detected. Retry transfer with slower frame rate.');
-    lastPacketEl.textContent = `Expected CRC32 ${transferState.fileCrc32.toString(16)} got ${computedCrc.toString(16)}`;
-    return;
-  }
-
-  if (transferState.expectedFileSize !== null && fileBytes.length !== transferState.expectedFileSize) {
-    failTransfer('Transfer incomplete, restart sender', 'File size mismatch detected during verification. Please retry transfer.');
-    return;
-  }
-
-  revokeDownloadUrl();
-  const blobData = new Uint8Array(fileBytes.length);
-  blobData.set(fileBytes);
-  downloadUrl = URL.createObjectURL(new Blob([blobData.buffer], { type: 'application/octet-stream' }));
-  downloadButton.disabled = false;
-  downloadButton.onclick = () => {
-    if (!downloadUrl) return;
-    const a = document.createElement('a');
-    a.href = downloadUrl;
-    a.download = transferState.fileName || 'received.bin';
-    a.click();
-  };
-  setStage('SUCCESS', 'File Ready! (Download)');
-  warningEl.textContent = '';
-  lastPacketEl.textContent = `${transferState.fileName} • ${fileBytes.length} bytes`;
-  if (soundEnabled) playDing();
-}
-
-
-function failTransfer(message: string, warning: string): void {
-  setStage('ERROR', message);
-  warningEl.textContent = warning;
-  stopScanLoop(true, false);
-  scanButton.textContent = 'Restart Scan';
-}
-
-function stopScanLoop(stopCamera = false, resetToIdle = true): void {
+function stopScanLoop(stopCamera = false): void {
   if (rafId) {
     cancelAnimationFrame(rafId);
     rafId = 0;
@@ -294,29 +158,114 @@ function stopScanLoop(stopCamera = false, resetToIdle = true): void {
   }
   if (stopCamera) {
     stopCameraStream();
-    if (resetToIdle) {
-      setStage('IDLE', 'Ready to scan');
-    }
     scanButton.textContent = 'Start Scan';
   }
 }
 
-function updateSignalHealth(): void {
-  if (panel.dataset.state !== 'SCANNING' && panel.dataset.state !== 'RECEIVING') return;
-  const now = Date.now();
-  const reference = lastPacketAt > 0 ? lastPacketAt : scanStartedAt;
-  if (reference > 0 && now - reference > SIGNAL_LOST_MS) {
-    warningEl.textContent = 'Signal Lost - Check Alignment';
+function updateProgress(snapshot: ReceiverSnapshot): void {
+  const total = snapshot.totalPackets ?? 0;
+  const received = snapshot.receivedCount;
+  const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+  progressBar.style.width = `${pct}%`;
+
+  if (snapshot.state === 'IDLE' || snapshot.state === 'SCANNING') {
+    progressText.textContent = 'Waiting for header';
+  } else if (snapshot.state === 'VERIFYING') {
+    progressText.textContent = 'Verifying';
+  } else if (snapshot.state === 'SUCCESS') {
+    progressText.textContent = `File ready: ${received}/${total}`;
+  } else if (snapshot.state === 'ERROR') {
+    progressText.textContent = `Transfer incomplete: ${received}/${total}`;
+  } else {
+    progressText.textContent = `Receiving packets: ${received}/${total} (${pct}%)`;
   }
 
-  if (transferState.headerReceived && transferState.lastUniquePacketAt && now - transferState.lastUniquePacketAt > NO_UNIQUE_PROGRESS_TIMEOUT_MS) {
-    failTransfer('Transfer incomplete, restart sender', 'No new unique packets for 15 seconds.');
+  scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets`;
+}
+
+function setStage(state: ReceiverSnapshot['state'], label: string): void {
+  panel.dataset.state = state;
+  statusEl.textContent = label;
+}
+
+function applyDownload(snapshot: ReceiverSnapshot): void {
+  if (!snapshot.fileBytes || downloadUrl) return;
+  const blobData = new Uint8Array(snapshot.fileBytes.length);
+  blobData.set(snapshot.fileBytes);
+  downloadUrl = URL.createObjectURL(new Blob([blobData.buffer], { type: 'application/octet-stream' }));
+  downloadButton.disabled = false;
+  downloadButton.onclick = () => {
+    if (!downloadUrl) return;
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = snapshot.fileName || 'received.bin';
+    a.click();
+  };
+}
+
+function applySnapshot(snapshot: ReceiverSnapshot): void {
+  updateProgress(snapshot);
+
+  if (snapshot.state === 'IDLE') {
+    setStage('IDLE', 'Ready to scan');
     return;
   }
 
-  if (transferState.endSeenAt && transferState.totalPackets !== null && transferState.receivedPackets.size < transferState.totalPackets && now - transferState.endSeenAt > END_GRACE_MS) {
-    failTransfer('Transfer incomplete, restart sender', 'END frame seen before all packets were received.');
+  if (snapshot.state === 'SCANNING') {
+    setStage('SCANNING', 'Waiting for header');
+    if (!warningEl.textContent.startsWith('Signal Lost')) {
+      warningEl.textContent = '';
+    }
+    return;
   }
+
+  if (snapshot.state === 'RECEIVING') {
+    setStage('RECEIVING', 'Receiving packets');
+    if (snapshot.fileName && snapshot.totalPackets !== null && snapshot.expectedFileSize !== null) {
+      lastPacketEl.textContent = `${snapshot.fileName} • ${snapshot.expectedFileSize} bytes • ${snapshot.totalPackets} packets`;
+    }
+    return;
+  }
+
+  if (snapshot.state === 'VERIFYING') {
+    setStage('VERIFYING', 'Verifying');
+    return;
+  }
+
+  if (snapshot.state === 'SUCCESS') {
+    setStage('SUCCESS', 'File ready');
+    warningEl.textContent = '';
+    applyDownload(snapshot);
+    if (!successSoundPlayed) {
+      successSoundPlayed = true;
+      playDing();
+    }
+    if (snapshot.fileName && snapshot.fileBytes) {
+      lastPacketEl.textContent = `${snapshot.fileName} • ${snapshot.fileBytes.length} bytes`;
+    }
+    return;
+  }
+
+  setStage('ERROR', snapshot.error?.code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH ? 'Decode error' : 'Transfer incomplete, restart sender');
+  if (snapshot.error?.code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
+    warningEl.textContent = 'Corruption error: file CRC32 mismatch detected. Retry with slower frame rate.';
+  } else {
+    warningEl.textContent = snapshot.error?.message ?? 'Transfer incomplete, restart sender';
+  }
+  stopScanLoop(true);
+  scanButton.textContent = 'Restart Scan';
+}
+
+function resetUiForNewScan(): void {
+  receiverMachine.startScanning();
+  revokeDownloadUrl();
+  downloadButton.disabled = true;
+  warningEl.textContent = '';
+  successSoundPlayed = false;
+  lastPacketEl.textContent = '';
+  lastPacketAt = 0;
+  lastReceivedTimeEl.textContent = 'Last packet: -';
+  applySnapshot(receiverMachine.snapshot);
 }
 
 function processFrame(now: number): void {
@@ -339,67 +288,37 @@ function processFrame(now: number): void {
 
   if (result?.data && result.data.startsWith(QR_PREFIX) && result.data !== lastDecodedPayload) {
     lastDecodedPayload = result.data;
-    transferState.totalScans += 1;
     try {
       const frame = parseFrame(base64ToBytes(result.data.slice(QR_PREFIX.length)));
-      if (frame.frameType === FRAME_TYPE_HEADER) {
-        applyHeaderFrame(frame);
-      } else if (frame.frameType === FRAME_TYPE_DATA) {
-        if (!transferState.headerReceived || transferState.totalPackets === null || transferState.transferId === null) {
-          warningEl.textContent = 'Waiting for header';
-          updateProgress();
-          rafId = requestAnimationFrame(processFrame);
-          return;
-        }
-
-        if (transferIdToKey(frame.transferId) !== transferState.transferId) {
-          logger.debug('[receiver] ignoring non-matching transfer data frame');
-          rafId = requestAnimationFrame(processFrame);
-          return;
-        }
-
-        if (frame.packetIndex < 0 || frame.packetIndex >= transferState.totalPackets) {
-          logger.debug('[receiver] ignoring out-of-range packet index', frame.packetIndex);
-          rafId = requestAnimationFrame(processFrame);
-          return;
-        }
-
-        if (!transferState.receivedPackets.has(frame.packetIndex)) {
-          transferState.receivedPackets.set(frame.packetIndex, frame.payload);
-          transferState.lastUniquePacketAt = Date.now();
-        }
-
-        setStage('RECEIVING', 'Receiving packets');
-        lastPacketEl.textContent = `Receiving packets: ${transferState.receivedPackets.size}/${transferState.totalPackets}`;
-      } else if (frame.frameType === FRAME_TYPE_END) {
-        if (transferState.transferId && transferIdToKey(frame.transferId) === transferState.transferId) {
-          transferState.endSeenAt = Date.now();
-          logger.debug('[receiver] end frame observed for active transfer');
-        }
-      }
-
+      const snapshot = receiverMachine.applyFrame(frame, Date.now());
+      applySnapshot(snapshot);
       lastPacketAt = Date.now();
       lastReceivedTimeEl.textContent = `Last packet: ${new Date(lastPacketAt).toLocaleTimeString()}`;
-      updateProgress();
-      if (transferState.totalPackets !== null && transferState.receivedPackets.size === transferState.totalPackets) {
-        void finalizeTransfer();
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown packet decode error.';
       logger.error('[receiver] packet validation failed', message);
-      if (panel.dataset.state === 'SCANNING' || panel.dataset.state === 'RECEIVING') {
-        warningEl.textContent = `Decode error: ${message}`;
-      } else {
-        failTransfer('Decode error', message);
-      }
+      warningEl.textContent = `Decode error: ${message}`;
     }
   }
 
   rafId = requestAnimationFrame(processFrame);
 }
 
+function updateSignalHealth(): void {
+  const snapshot = receiverMachine.tick(Date.now());
+  applySnapshot(snapshot);
+
+  if (snapshot.state !== 'SCANNING' && snapshot.state !== 'RECEIVING') return;
+
+  const now = Date.now();
+  const reference = lastPacketAt > 0 ? lastPacketAt : scanStartedAt;
+  if (reference > 0 && now - reference > SIGNAL_LOST_MS) {
+    warningEl.textContent = 'Signal Lost - Check Alignment';
+  }
+}
+
 async function startScan(): Promise<void> {
-  resetTransferState();
+  resetUiForNewScan();
   setStage('SCANNING', 'Initializing Camera...');
 
   try {
@@ -415,7 +334,8 @@ async function startScan(): Promise<void> {
     monitorInterval = window.setInterval(updateSignalHealth, 1000);
   } catch {
     setStage('ERROR', 'Camera error');
-    warningEl.textContent = 'On Android Chrome, enable Camera permission for this site.';
+    warningEl.textContent = 'Camera error: enable camera permission for this site and retry.';
+    scanButton.textContent = 'Restart Scan';
   }
 }
 
@@ -423,6 +343,8 @@ scanButton.addEventListener('click', async () => {
   await resumeAudioContext();
   if (activeStream) {
     stopScanLoop(true);
+    receiverMachine.reset();
+    applySnapshot(receiverMachine.snapshot);
     return;
   }
   await startScan();
@@ -450,4 +372,5 @@ window.addEventListener('beforeunload', () => {
 });
 
 setTheme(localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark');
-updateProgress();
+receiverMachine.reset();
+applySnapshot(receiverMachine.snapshot);

@@ -1,11 +1,19 @@
 import './style.css';
 import QRCode from 'qrcode';
-import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, PROTOCOL_ERROR_CODES, ProtocolError, assembleFrame, chunkFile, type TransferFrame } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferFrame } from '@qr-data-bridge/protocol';
+import {
+  MAX_FILE_SIZE_BYTES,
+  buildTransmissionFrames,
+  encodeFrameToCanvas,
+  readFileBytes,
+  toUserFacingSenderError,
+  validateFileBeforeTransmission
+} from './senderCore';
 
 const QR_PREFIX = 'QDB64:';
 const SETTINGS_KEY = 'qdb_sender_settings_v2';
 const THEME_KEY = 'qdb_theme';
-const MAX_FILE_SIZE_BYTES = 1024 * 1024;
+
 const LARGE_FILE_WARNING_BYTES = 512 * 1024;
 
 const logger = {
@@ -20,39 +28,6 @@ const logger = {
 let sharedAudioContext: AudioContext | null = null;
 
 
-function asErrorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
-}
-
-
-function toUserFacingSenderError(error: unknown): { title: string; warning: string } {
-  if (error instanceof ProtocolError) {
-    if (error.code === PROTOCOL_ERROR_CODES.INVALID_FILE_NAME) {
-      return {
-        title: `Error: filename limit exceeded: ${error.message}`,
-        warning: 'Rename the file to a shorter UTF-8 name and try again.'
-      };
-    }
-
-    if (error.code === PROTOCOL_ERROR_CODES.PACKET_BOUNDS) {
-      return {
-        title: `Error: too many packets: ${error.message}`,
-        warning: 'Increase chunk size or pick a smaller file.'
-      };
-    }
-
-    return {
-      title: `Error: packetization failed: ${error.message}`,
-      warning: 'Adjust settings and retry transmission.'
-    };
-  }
-
-  const message = asErrorMessage(error, 'Packetization failed.');
-  return {
-    title: `Error: packetization failed: ${message}`,
-    warning: 'Adjust settings and retry transmission.'
-  };
-}
 
 
 type SenderStage = 'NO_FILE' | 'READY' | 'COUNTDOWN' | 'TRANSMITTING' | 'COMPLETE' | 'ERROR';
@@ -81,11 +56,6 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
 
 function formatDuration(ms: number): string {
   const totalSeconds = Math.ceil(ms / 1000);
@@ -306,9 +276,9 @@ function updateSettingsUi(): void {
 
 function rebuildFrames(): void {
   if (!fileBytes) return;
-  const transfer = chunkFile(fileBytes, { fileName: selectedFileName, maxPayloadSize: effectiveChunkSize(), includeEndFrame: true });
-  transmissionFrames = [transfer.header, ...transfer.dataFrames, ...(transfer.endFrame ? [transfer.endFrame] : [])];
-  totalDataPackets = transfer.dataFrames.length;
+  const transmission = buildTransmissionFrames(fileBytes, selectedFileName, effectiveChunkSize());
+  transmissionFrames = transmission.frames;
+  totalDataPackets = transmission.totalDataPackets;
   const nextStreamFrames: TransferFrame[] = [];
   for (const frame of transmissionFrames) {
     if (frame.frameType === FRAME_TYPE_DATA) {
@@ -318,7 +288,7 @@ function rebuildFrames(): void {
     }
   }
   streamFrames = nextStreamFrames;
-  fileMeta.textContent = `${selectedFileName} • ${fileBytes.length} bytes • ${transfer.dataFrames.length} packets • ${streamFrames.length} total scans`;
+  fileMeta.textContent = `${selectedFileName} • ${fileBytes.length} bytes • ${totalDataPackets} packets • ${streamFrames.length} total scans`;
   refreshEstimates();
 }
 
@@ -377,12 +347,10 @@ function stopTransmission(message = 'Transmission stopped.', stage: SenderStage 
 
 async function renderFrame(index: number): Promise<void> {
   const frame = streamFrames[index];
-  const payload = `${QR_PREFIX}${bytesToBase64(assembleFrame(frame))}`;
-  await QRCode.toCanvas(qrCanvas, payload, {
-    errorCorrectionLevel: settings.qrErrorCorrection,
-    width: settings.qrSizePx,
-    margin: 1,
-    color: { dark: '#000000', light: '#FFFFFF' }
+  await encodeFrameToCanvas(frame, qrCanvas, {
+    qrPrefix: QR_PREFIX,
+    qrErrorCorrection: settings.qrErrorCorrection,
+    qrSizePx: settings.qrSizePx
   });
   packetMeta.textContent = frame.frameType === FRAME_TYPE_DATA
     ? `Sending ${frameLabel(frame)}`
@@ -490,21 +458,22 @@ fileInput.addEventListener('change', async () => {
     return;
   }
 
-  if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
+  const invalidReason = validateFileBeforeTransmission(selectedFile);
+  if (invalidReason) {
     transmissionFrames = [];
     streamFrames = [];
     totalDataPackets = 0;
     fileBytes = null;
     selectedFileName = '';
     fileMeta.textContent = 'File too large (1 MiB max).';
-    setSenderStage('ERROR', 'File too large');
-    warningMeta.textContent = 'Large files may take a very long time and may fail more often.';
+    setSenderStage('ERROR', invalidReason.title);
+    warningMeta.textContent = invalidReason.warning;
     startButton.disabled = true;
     return;
   }
 
   try {
-    fileBytes = new Uint8Array(await selectedFile.arrayBuffer());
+    fileBytes = await readFileBytes(selectedFile);
   } catch (error) {
     transmissionFrames = [];
     streamFrames = [];
@@ -512,7 +481,7 @@ fileInput.addEventListener('change', async () => {
     fileBytes = null;
     selectedFileName = '';
     fileMeta.textContent = 'Error reading file.';
-    setSenderStage('ERROR', `Error: file read failed: ${asErrorMessage(error, 'Unable to read selected file.')}`);
+    setSenderStage('ERROR', error instanceof Error ? error.message : 'Error: file read failed.');
     warningMeta.textContent = 'Try re-selecting the file and restart transmission.';
     startButton.disabled = true;
     return;
