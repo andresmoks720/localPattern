@@ -1,5 +1,8 @@
 # QR Data Bridge MVPv2 Requirements and Limits
 
+This file is the **normative MVPv2 specification**.
+Backlog/gap analysis, TODO tracking, and implementation sequencing must live outside this file (see `mvp_todo.md` and `mvp_roadmap.md`).
+
 ## Purpose
 
 MVPv2 delivers a **minimal, one-way QR file transfer** that is dependable for small files in controlled conditions and is built on a cleaner protocol/service boundary than the earlier MVP.
@@ -149,7 +152,7 @@ No extra frame types.
 All layouts below are byte-exact and authoritative.
 
 #### HEADER layout
-`magic(4) | type(1) | transferId(8) | fileNameLen(2) | fileNameUtf8(n) | fileSize(4) | totalPackets(2) | fileCrc32(4)`
+`magic(4) | type(1) | transferId(8) | fileNameLen(2) | fileNameUtf8(n) | fileSize(4) | totalPackets(2) | fileCrc32(4) | headerCrc32(4)`
 
 #### DATA layout
 `magic(4) | type(1) | transferId(8) | packetIndex(2) | payloadLen(2) | payload(n) | packetCrc32(4)`
@@ -168,6 +171,7 @@ All layouts below are byte-exact and authoritative.
 - file size
 - total packet count
 - full-file CRC32
+- header CRC32
 
 #### `DATA`
 - Protocol magic/version
@@ -185,6 +189,35 @@ All layouts below are byte-exact and authoritative.
 
 ### CRC coverage
 CRC behavior is fixed and must not vary between implementations.
+
+### CRC32 variant (all CRC32 fields)
+Use this exact CRC variant for packet CRC32, full-file CRC32, and HEADER CRC32:
+
+- CRC variant: `CRC-32/IEEE 802.3`
+- Polynomial: `0x04C11DB7`
+- Reflected input: `yes`
+- Reflected output: `yes`
+- Init: `0xFFFFFFFF`
+- Final XOR: `0xFFFFFFFF`
+- Serialized output: `uint32 big-endian`
+
+Expected CRC32 for an empty byte sequence under this variant is `0x00000000`.
+
+### HEADER CRC32
+- HEADER CRC32 is computed over:
+  - `transferId(8)`
+  - `fileNameLen(2)`
+  - `fileNameUtf8(n)`
+  - `fileSize(4)`
+  - `totalPackets(2)`
+  - `fileCrc32(4)`
+
+It is **not** computed over:
+- magic
+- frame type byte
+- `headerCrc32` field itself
+
+A `HEADER` is valid only if `headerCrc32` matches this coverage exactly.
 
 #### Packet CRC32
 - Packet CRC32 is computed over:
@@ -236,7 +269,7 @@ Zero-byte files are allowed and must follow this exact protocol:
 For `totalPackets = 0`, receiver must **not** finalize on `HEADER` alone even though the packet set is vacuously complete; it must wait for valid `END`.
 
 ### Repeated matching control-frame behavior
-- Repeated matching `HEADER` after lock with the same `transferId` is a **no-op**, not a reset, **only if** all locked header metadata matches exactly.
+- Repeated matching `HEADER` after lock with the same `transferId` is a **no-op**, not a reset, **only if** all locked header metadata matches exactly **and** `headerCrc32` is valid.
 - If a later `HEADER` has the same `transferId` but conflicting metadata (`fileName`, `fileSize`, `totalPackets`, or `fileCrc32`), that is a **terminal protocol error** for the attempt.
 - Repeated matching `END` after already seeing matching `END` is a **no-op**.
 - `END` before valid `HEADER` is ignored.
@@ -248,6 +281,10 @@ MVPv2 must not use:
 - “First data chunk is special header” delimiter formats
 - Text/JSON-first transport framing for file payloads
 - Success defined only as “all indices seen” without final file verification
+
+### Binary protocol vs QR-safe text wrapper
+- The authoritative protocol payload is the raw binary frame layout defined in this spec.
+- An outer QR-safe text encoding layer may be used for display/scanning transport, but it must be a reversible wrapper around the binary frame and must not redefine protocol structure or semantics.
 
 ---
 
@@ -272,6 +309,11 @@ MVPv2 must not use:
 - No automatic full-transfer repeat.
 - No continuous `HEADER` / `END` loops.
 - No waiting for receiver confirmation.
+
+### Sender timing assumptions (MVPv2 fixed behavior)
+- MVPv2 ships with one fixed `DATA` frame display duration default: **2000 ms**.
+- MVPv2 does not expose advanced timing controls in UI.
+- Implementations may keep an internal bounded constant range for experiments, but production MVPv2 behavior must use a fixed default and must not expose frame timing as an open-ended user knob.
 
 ### Frame preparation and caching
 - Sender must precompute packetization and frame payloads before transmission starts.
@@ -309,6 +351,8 @@ Sender must not replace `END` immediately with a pretty completion view.
 Before transmission starts, sender should show:
 - estimated packet count
 - estimated transfer duration based on current settings
+
+Estimated transfer duration must include `HEADER` hold, all `DATA` frame display intervals, and `END` hold, but may exclude optional countdown.
 
 This is required product honesty, not optional decoration.
 
@@ -406,11 +450,18 @@ These are separate concerns and must remain separate in code and tests.
 - Protocol correctness must not depend on scanner dedupe behavior.
 
 ### Completion rule
-Receiver succeeds only when all are true:
-- Every packet index `0..totalPackets-1` is present
-- File reassembly succeeds
-- Full-file CRC32 passes
-- File size matches expected size
+For non-empty files, receiver succeeds only when all are true:
+- every packet index `0..totalPackets-1` is present
+- file reassembly succeeds
+- full-file CRC32 passes
+- file size matches expected size
+
+For non-empty files, `END` is **not required** for success.
+
+`END` remains relevant for:
+- zero-byte file completion
+- sender-finished signaling
+- incomplete-transfer failure timing
 
 `END` alone is never success.
 
@@ -635,12 +686,17 @@ Stale-resource bugs must be treated as correctness bugs, not mere polish issues.
 
 ## Implementation Rules
 
-- No redesign: no framework migration, architecture rewrite, protocol v3, or unrelated feature expansion.
+- Avoid framework migration or broad product redesign, but allow targeted refactoring required to enforce protocol correctness, explicit state transitions, and service/module boundaries defined in this spec.
 - Prefer minimal safe edits only where required for MVPv2 correctness.
 - Preserve existing UI structure unless correctness requires change.
 - Make state transitions explicit.
 - No silent fallbacks: validation/decode failures must set clear state/message.
 - Keep future path open for ACK/backchannel, loop mode, larger files, repair mode, and possible FEC, but do not implement them now.
+
+### Redundancy behavior (frozen for MVPv2)
+- Redundancy is not a user-facing tuning control in MVPv2.
+- If repeated DATA emission exists in implementation, it must be fixed and explicitly documented as sender-side emission policy, not adaptive recovery.
+- Preferred MVPv2 policy is fixed redundancy constant `1` (each DATA packet emitted once per attempt).
 
 ### Dependency and packaging rules
 - Do not depend on remote CDN delivery for core app functionality.
