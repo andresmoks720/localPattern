@@ -1,6 +1,7 @@
 export const MAGIC_BYTES = new Uint8Array([0x51, 0x44, 0x42, 0x32]); // QDB2
 export const LEGACY_MAGIC_BYTES = new Uint8Array([0x51, 0x44, 0x42, 0x31]); // QDB1
 export const PROTOCOL_VERSION = '2.0.0';
+export const PROTOCOL_VERSION_BYTE = 0x02;
 
 export const FRAME_TYPE_HEADER = 0x01;
 export const FRAME_TYPE_DATA = 0x02;
@@ -17,6 +18,7 @@ export interface TransferHeaderFrame {
 
 export interface TransferDataFrame {
   frameType: typeof FRAME_TYPE_DATA;
+  transferId: Uint8Array;
   packetIndex: number;
   payload: Uint8Array;
   packetCrc32: number;
