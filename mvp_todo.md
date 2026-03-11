@@ -16,35 +16,35 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 
 - [x] **Enforce sender hard cap at 1 MiB** (currently sender allows up to 10 MiB).
 - [x] **Show warning at > 512 KiB** with MVP wording (“Large files may take a very long time and may fail more often.” or equivalent).
-- [ ] Ensure rejection happens **before packetization/transmission starts**.
+- [x] Ensure rejection happens **before packetization/transmission starts**.
 
 ---
 
 ## 2) Protocol conformance (`HEADER` / `DATA` / `END`)
 
 ### 2.0 Library boundary and documentation
-- [ ] Keep protocol logic in library-ish modules, not scattered across UI handlers.
-- [ ] Separate concerns clearly: frame parse/assemble, sender transport flow, receiver reassembly/state machine.
-- [ ] Document message formats and valid state transitions in protocol docs/spec notes.
+- [x] Keep protocol logic in library-ish modules, not scattered across UI handlers.
+- [x] Separate concerns clearly: frame parse/assemble, sender transport flow, receiver reassembly/state machine.
+- [x] Document message formats and valid state transitions in protocol docs/spec notes.
 
 ### 2.1 Frame fields
 - [x] Add `transferId` to **DATA** frame type, assembly, and parsing.
 - [x] Include/validate **protocol version** explicitly per frame format (current parser mostly relies on magic bytes).
-- [ ] Keep supported frame types exactly `HEADER`, `DATA`, `END` only.
+- [x] Keep supported frame types exactly `HEADER`, `DATA`, `END` only.
 
 ### 2.5 Typed messages and explicit error classes
-- [ ] Use explicit typed message variants/classes for `HEADER` / `DATA` / `END` (avoid ad hoc boolean-driven shape checks).
-- [ ] Introduce/keep explicit machine-readable protocol error categories/codes (not string-only errors).
-- [ ] Ensure protocol/state logic branches on error codes, while UI maps codes to user copy.
+- [x] Use explicit typed message variants/classes for `HEADER` / `DATA` / `END` (avoid ad hoc boolean-driven shape checks).
+- [x] Introduce/keep explicit machine-readable protocol error categories/codes (not string-only errors).
+- [x] Ensure protocol/state logic branches on error codes, while UI maps codes to user copy.
 
 ### 2.2 Transfer identity and lock isolation
 - [x] Receiver must lock on first valid HEADER and then ignore all non-matching frames (including HEADER) until `SUCCESS`, `ERROR`, or manual reset.
 - [x] Remove any behavior that auto-resets/merges when a different transfer is seen mid-attempt.
 
 ### 2.3 Integrity
-- [ ] Preserve per-packet CRC32 validation for DATA.
-- [ ] Preserve full-file CRC32 validation after reassembly.
-- [ ] Ensure CRC failures are explicit user-visible error reasons (not silent).
+- [x] Preserve per-packet CRC32 validation for DATA.
+- [x] Preserve full-file CRC32 validation after reassembly.
+- [x] Ensure CRC failures are explicit user-visible error reasons (not silent).
 
 ### 2.4 Packet index validity
 - [x] Explicitly ignore/reject DATA frames with index outside `0..totalPackets-1`.
@@ -59,22 +59,22 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] Replace loose booleans/timers with explicit state transitions.
 
 ### 3.2 Sender flow and one-pass mode
-- [ ] Keep one-pass `HEADER -> DATA (ordered) -> END`.
-- [ ] Keep no backchannel waiting, no automatic resend loop, no continuous HEADER/END looping.
-- [ ] Keep stable final informational state after END (must not imply receiver success).
+- [x] Keep one-pass `HEADER -> DATA (ordered) -> END`.
+- [x] Keep no backchannel waiting, no automatic resend loop, no continuous HEADER/END looping.
+- [x] Keep stable final informational state after END (must not imply receiver success).
 
 ### 3.3 Sender error handling (must be surfaced)
-- [ ] Catch and surface **file read failures**.
-- [ ] Catch and surface **packetization failures**.
-- [ ] Catch and surface **too-many-packets / bounds failures**.
-- [ ] Catch and surface **filename encoding limit failures**.
-- [ ] Catch and surface **QR encode failures**.
-- [ ] Catch and surface **finalize/render failures**.
-- [ ] Ensure no unhandled promise rejections in sender workflow.
+- [x] Catch and surface **file read failures**.
+- [x] Catch and surface **packetization failures**.
+- [x] Catch and surface **too-many-packets / bounds failures**.
+- [x] Catch and surface **filename encoding limit failures**.
+- [x] Catch and surface **QR encode failures**.
+- [x] Catch and surface **finalize/render failures**.
+- [x] Ensure no unhandled promise rejections in sender workflow.
 
 ### 3.4 Filename policy (reject-only)
-- [ ] If filename cannot be encoded or exceeds protocol limits, fail with clear user-visible error.
-- [ ] Do **not** silently truncate or mutate filename as fallback behavior.
+- [x] If filename cannot be encoded or exceeds protocol limits, fail with clear user-visible error.
+- [x] Do **not** silently truncate or mutate filename as fallback behavior.
 
 ---
 
@@ -123,13 +123,13 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 ## 5) UI/UX copy alignment (minimal text changes)
 
 ### Sender required messages
-- [ ] No file selected
-- [ ] File too large
-- [ ] Ready to transmit
-- [ ] Starting in…
-- [ ] Sending packet X / N
-- [ ] Transmission finished
-- [ ] Error with actionable reason
+- [x] No file selected
+- [x] File too large
+- [x] Ready to transmit
+- [x] Starting in…
+- [x] Sending packet X / N
+- [x] Transmission finished
+- [x] Error with actionable reason
 
 ### Receiver required messages
 - [ ] Ready to scan
@@ -141,15 +141,15 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] Decode error / camera error / corruption error
 
 ### Copy quality
-- [ ] Keep reason-specific wording (no vague catch-all errors).
+- [x] Keep reason-specific wording (no vague catch-all errors).
 
 ---
 
 ## 6) Out-of-scope cleanup / guardrails
 
-- [ ] Verify no out-of-scope recovery features are added (ACK/NACK, auto resend-until-success, loop mode, etc.).
-- [ ] Keep single active transfer only.
-- [ ] Keep implementation minimal and avoid architecture/framework rewrites.
+- [x] Verify no out-of-scope recovery features are added (ACK/NACK, auto resend-until-success, loop mode, etc.).
+- [x] Keep single active transfer only.
+- [x] Keep implementation minimal and avoid architecture/framework rewrites.
 
 ---
 
@@ -161,15 +161,15 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] Keep scanner/renderer tests separate from core protocol tests.
 
 ### 7.1 Protocol tests
-- [ ] HEADER roundtrip parse/assemble
-- [ ] DATA roundtrip parse/assemble
-- [ ] END roundtrip parse/assemble
-- [ ] DATA CRC32 mismatch rejected
+- [x] HEADER roundtrip parse/assemble
+- [x] DATA roundtrip parse/assemble
+- [x] END roundtrip parse/assemble
+- [x] DATA CRC32 mismatch rejected
 - [ ] full-file CRC32 mismatch rejected
-- [ ] wrong protocol magic/version rejected
+- [x] wrong protocol magic/version rejected
 - [ ] `transferId` required and validated
 - [ ] DATA with wrong `transferId` ignored by receiver logic
-- [ ] structured protocol error codes are emitted for representative failures
+- [x] structured protocol error codes are emitted for representative failures
 
 ### 7.2 Sender tests
 - [ ] file > 1 MiB rejected

@@ -68,8 +68,8 @@ Workflow file: `.github/workflows/deploy-pages.yml`.
 No data leaves your device through network transfer APIs. Transfers are line-of-sight only. No encryption layer is added in v1.0.
 
 ## Limitations
-- Recommended max file size: **5MB**.
-- Hard sender limit: **10MB** for mobile stability.
+- Recommended max file size: **<= 512 KiB**.
+- Hard sender limit: **1 MiB**.
 - Long transfers can warm devices.
 - No retry handshake yet; restart sender/receiver on severe packet loss.
 

@@ -6,6 +6,8 @@ import {
   LEGACY_MAGIC_BYTES,
   MAGIC_BYTES,
   PROTOCOL_VERSION_BYTE,
+  PROTOCOL_ERROR_CODES,
+  ProtocolError,
   type ChunkFileOptions,
   type ChunkedTransfer,
   type TransferDataFrame,
@@ -22,19 +24,19 @@ const textDecoder = new TextDecoder();
 
 function assertUint16(value: number, fieldName: string): void {
   if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
-    throw new Error(`${fieldName} must be a uint16.`);
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_UINT16, `${fieldName} must be a uint16.`);
   }
 }
 
 function assertUint32(value: number, fieldName: string): void {
   if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
-    throw new Error(`${fieldName} must be a uint32.`);
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_UINT32, `${fieldName} must be a uint32.`);
   }
 }
 
 function assertTransferId(transferId: Uint8Array): void {
   if (transferId.length !== TRANSFER_ID_SIZE) {
-    throw new Error('transferId must be exactly 8 bytes.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_TRANSFER_ID, 'transferId must be exactly 8 bytes.');
   }
 }
 
@@ -53,7 +55,11 @@ export function assembleFrame(frame: TransferFrame): Uint8Array {
     return assembleDataFrame(frame);
   }
 
-  return assembleEndFrame(frame);
+  if (frame.frameType === FRAME_TYPE_END) {
+    return assembleEndFrame(frame);
+  }
+
+  throw new ProtocolError(PROTOCOL_ERROR_CODES.UNSUPPORTED_FRAME_TYPE, `Unsupported frame type: ${(frame as { frameType?: unknown }).frameType as string}`);
 }
 
 function assembleHeaderFrame(frame: TransferHeaderFrame): Uint8Array {
@@ -61,7 +67,11 @@ function assembleHeaderFrame(frame: TransferHeaderFrame): Uint8Array {
   assertUint32(frame.fileSize, 'fileSize');
   assertUint16(frame.totalPackets, 'totalPackets');
 
-  const encodedFileName = textEncoder.encode(frame.fileName.trim() || 'unnamed.bin');
+  const normalizedFileName = frame.fileName.trim();
+  if (!normalizedFileName) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_FILE_NAME, 'fileName must not be empty.');
+  }
+  const encodedFileName = textEncoder.encode(normalizedFileName);
   assertUint16(encodedFileName.length, 'fileName byte length');
 
   const bytes = new Uint8Array(4 + 1 + 1 + TRANSFER_ID_SIZE + 2 + encodedFileName.length + 4 + 2 + 4);
@@ -83,7 +93,7 @@ function assembleDataFrame(frame: TransferDataFrame): Uint8Array {
   assertUint16(frame.packetIndex, 'packetIndex');
   const computedPacketCrc32 = calculateCRC32(frame.payload);
   if (computedPacketCrc32 !== frame.packetCrc32) {
-    throw new Error('packetCrc32 mismatch for data payload.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.PACKET_CRC_MISMATCH, 'packetCrc32 mismatch for data payload.');
   }
 
   assertTransferId(frame.transferId);
@@ -112,25 +122,25 @@ function assembleEndFrame(frame: TransferEndFrame): Uint8Array {
 
 export function parseFrame(frameBytes: Uint8Array): TransferFrame {
   if (frameBytes.length < 5) {
-    throw new Error('Frame is too small.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.FRAME_TOO_SMALL, 'Frame is too small.');
   }
 
   if (LEGACY_MAGIC_BYTES.every((byte, index) => frameBytes[index] === byte)) {
-    throw new Error('Version Mismatch');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.VERSION_MISMATCH, 'Version Mismatch');
   }
 
   if (!MAGIC_BYTES.every((byte, index) => frameBytes[index] === byte)) {
-    throw new Error('Invalid frame magic bytes.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_MAGIC, 'Invalid frame magic bytes.');
   }
 
   const frameType = frameBytes[4];
   if (frameBytes.length < 6) {
-    throw new Error('Frame missing protocol version byte.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.FRAME_TOO_SMALL, 'Frame missing protocol version byte.');
   }
 
   const version = frameBytes[5];
   if (version !== PROTOCOL_VERSION_BYTE) {
-    throw new Error('Unsupported protocol version byte.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.UNSUPPORTED_VERSION, 'Unsupported protocol version byte.');
   }
   if (frameType === FRAME_TYPE_HEADER) {
     return parseHeaderFrame(frameBytes);
@@ -142,12 +152,12 @@ export function parseFrame(frameBytes: Uint8Array): TransferFrame {
     return parseEndFrame(frameBytes);
   }
 
-  throw new Error(`Unsupported frame type: ${frameType}`);
+  throw new ProtocolError(PROTOCOL_ERROR_CODES.UNSUPPORTED_FRAME_TYPE, `Unsupported frame type: ${frameType}`);
 }
 
 function parseHeaderFrame(frameBytes: Uint8Array): TransferHeaderFrame {
   if (frameBytes.length < 4 + 1 + 1 + TRANSFER_ID_SIZE + 2 + 4 + 2 + 4) {
-    throw new Error('Header frame is too small.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_HEADER, 'Header frame is too small.');
   }
 
   const view = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
@@ -158,7 +168,7 @@ function parseHeaderFrame(frameBytes: Uint8Array): TransferHeaderFrame {
   const tailStart = nameEnd;
 
   if (tailStart + 10 > frameBytes.length) {
-    throw new Error('Malformed header frame.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_HEADER, 'Malformed header frame.');
   }
 
   const fileName = textDecoder.decode(frameBytes.slice(nameStart, nameEnd));
@@ -178,7 +188,7 @@ function parseHeaderFrame(frameBytes: Uint8Array): TransferHeaderFrame {
 
 function parseDataFrame(frameBytes: Uint8Array): TransferDataFrame {
   if (frameBytes.length < 4 + 1 + 1 + TRANSFER_ID_SIZE + 2 + 4) {
-    throw new Error('Data frame is too small.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_DATA, 'Data frame is too small.');
   }
 
   const view = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
@@ -188,14 +198,14 @@ function parseDataFrame(frameBytes: Uint8Array): TransferDataFrame {
   const payloadEnd = frameBytes.length - 4;
 
   if (payloadEnd < payloadStart) {
-    throw new Error('Malformed data frame payload offsets.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_DATA, 'Malformed data frame payload offsets.');
   }
 
   const payload = frameBytes.slice(payloadStart, payloadEnd);
   const packetCrc32 = view.getUint32(payloadEnd);
 
   if (calculateCRC32(payload) !== packetCrc32) {
-    throw new Error('Packet CRC32 check failed.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.PACKET_CRC_MISMATCH, 'Packet CRC32 check failed.');
   }
 
   return {
@@ -209,7 +219,7 @@ function parseDataFrame(frameBytes: Uint8Array): TransferDataFrame {
 
 function parseEndFrame(frameBytes: Uint8Array): TransferEndFrame {
   if (frameBytes.length !== 4 + 1 + 1 + TRANSFER_ID_SIZE) {
-    throw new Error('Malformed END frame.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_END, 'Malformed END frame.');
   }
 
   return {
@@ -221,12 +231,22 @@ function parseEndFrame(frameBytes: Uint8Array): TransferEndFrame {
 export function chunkFile(file: Uint8Array, options: ChunkFileOptions = {}): ChunkedTransfer {
   const maxPayloadSize = options.maxPayloadSize ?? DEFAULT_MAX_PAYLOAD_SIZE;
   if (maxPayloadSize <= 0 || !Number.isInteger(maxPayloadSize)) {
-    throw new Error('maxPayloadSize must be a positive integer.');
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_MAX_PAYLOAD_SIZE, 'maxPayloadSize must be a positive integer.');
   }
 
-  const normalizedFileName = options.fileName?.trim() || 'unnamed.bin';
+  const normalizedFileName = options.fileName?.trim();
+  if (!normalizedFileName) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_FILE_NAME, 'fileName must not be empty.');
+  }
   const totalPackets = Math.max(1, Math.ceil(file.length / maxPayloadSize));
-  assertUint16(totalPackets, 'totalPackets');
+  try {
+    assertUint16(totalPackets, 'totalPackets');
+  } catch (error) {
+    if (error instanceof ProtocolError && error.code === PROTOCOL_ERROR_CODES.INVALID_UINT16) {
+      throw new ProtocolError(PROTOCOL_ERROR_CODES.PACKET_BOUNDS, 'totalPackets exceeds protocol limits.');
+    }
+    throw error;
+  }
 
   const transferId = options.transferId ?? createTransferId();
   assertTransferId(transferId);
