@@ -19,11 +19,15 @@
 - This preserves binary integrity for arbitrary file types and avoids UTF-8 corruption risks.
 
 ## Reliability Defaults
-- QR render canvas uses a large fixed internal resolution (`1024x1024`) while CSS scales it to consume most of the viewport.
-- QR error correction level set to `H`.
-- `FRAME_DURATION_MS = 2000` by default: this trades speed for better decode reliability and gives slower cameras enough dwell time per frame.
+- QR size is settings-driven via the sender slider (`200-600px`), with a default of `400px`; rendering forces high-contrast black-on-white colors (`#000000` on `#FFFFFF`) for decoder reliability.
+- QR error correction level defaults to `H`.
+- Frame duration defaults to `2000ms`: this trades speed for better decode reliability and gives slower cameras enough dwell time per frame.
 - Receiver decode loop is throttled to one decode attempt every `300ms` to reduce CPU load while preserving responsiveness.
 - Sender defaults to **stop at end** rather than looping, so users get a clear end-of-stream and ETA.
-
-- Passive redundancy defaults to 3x per packet (`REDUNDANCY_COUNT=3`) to improve scan reliability without introducing ACK/NACK complexity.
+- Effective throughput is primarily controlled by three settings together: `frameDurationMs`, effective chunk size (auto-estimated from QR size/error correction or manual chunk size), and `redundancyCount`.
+- Passive redundancy defaults to 3x per packet (`redundancyCount=3`) to improve scan reliability without introducing ACK/NACK complexity.
 - Sender requests a screen wake lock during active transmission (when supported) to reduce screen dimming failures.
+- Receiver stats semantics: once issue #1 is fixed, receiver UI should consistently present **total scans** separately from **unique packets**.
+
+### Canonical Defaults Source
+- Keep sender defaults documented from one canonical source: `sender/src/main.ts` `DEFAULT_SETTINGS`. Reference this object for README/agents/docs updates to avoid drift across files.
