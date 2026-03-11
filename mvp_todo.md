@@ -81,42 +81,42 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 ## 4) Receiver behavior + state machine
 
 ### 4.1 Explicit receiver states
-- [ ] Ensure receiver uses required states exactly: `IDLE`, `SCANNING`, `RECEIVING`, `VERIFYING`, `SUCCESS`, `ERROR`.
-- [ ] Make `ERROR` terminal for current attempt (no silent continued merging).
+- [x] Ensure receiver uses required states exactly: `IDLE`, `SCANNING`, `RECEIVING`, `VERIFYING`, `SUCCESS`, `ERROR`.
+- [x] Make `ERROR` terminal for current attempt (no silent continued merging).
 
 ### 4.2 Passive-only constraints
-- [ ] Keep receiver fully passive: no ACK/NACK/requests and no assumptions sender can react.
+- [x] Keep receiver fully passive: no ACK/NACK/requests and no assumptions sender can react.
 
 ### 4.3 Ignorable frames vs terminal errors
-- [ ] While scanning, treat these as ignorable (non-terminal):
+- [x] While scanning, treat these as ignorable (non-terminal):
   - DATA before valid HEADER
   - duplicate DATA for existing packet index
   - non-matching `transferId` frames
   - malformed/noise frames
-- [ ] Reserve terminal `ERROR` for:
+- [x] Reserve terminal `ERROR` for:
   - camera failure
   - END seen while incomplete after grace window
   - no unique progress timeout
   - reassembly/verification failures
 
 ### 4.4 Completion semantics
-- [ ] Complete only when all packet indices exist, reassembly succeeds, full-file CRC32 passes, and file size matches expected.
-- [ ] END frame alone must never be treated as success.
+- [x] Complete only when all packet indices exist, reassembly succeeds, full-file CRC32 passes, and file size matches expected.
+- [x] END frame alone must never be treated as success.
 
 ### 4.5 Fixed MVP timeout behavior
 - [x] Implement fixed END grace window: **2000 ms**.
 - [x] Implement fixed no-unique-progress timeout: **15000 ms**.
 - [x] Track `lastUniquePacketAt` and do not let duplicates extend timeout.
-- [ ] On timeout/incomplete END, transition to terminal ERROR with actionable message.
-- [ ] Do not depend on sender runtime settings (frame duration/redundancy) unless explicitly in protocol metadata.
+- [x] On timeout/incomplete END, transition to terminal ERROR with actionable message.
+- [x] Do not depend on sender runtime settings (frame duration/redundancy) unless explicitly in protocol metadata.
 
 ### 4.6 Post-failure behavior
-- [ ] After terminal failure, keep explicit ERROR state until user restart/reset.
-- [ ] Do not silently continue receiving into failed attempt.
+- [x] After terminal failure, keep explicit ERROR state until user restart/reset.
+- [x] Do not silently continue receiving into failed attempt.
 
 ### 4.7 Zero-byte files
-- [ ] Support zero-byte files with deterministic behavior (explicit success/failure path, no hangs).
-- [ ] Add explicit sender behavior for zero-byte files (deterministic frame sequence and terminal state).
+- [x] Support zero-byte files with deterministic behavior (explicit success/failure path, no hangs).
+- [x] Add explicit sender behavior for zero-byte files (deterministic frame sequence and terminal state).
 
 ---
 

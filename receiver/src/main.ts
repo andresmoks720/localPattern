@@ -231,15 +231,14 @@ function applyHeaderFrame(header: TransferHeaderFrame): void {
 }
 
 async function finalizeTransfer(): Promise<void> {
-  if (!transferState.totalPackets || transferState.fileCrc32 === null) return;
+  if (transferState.totalPackets === null || transferState.fileCrc32 === null) return;
   setStage('VERIFYING', 'Verifying...');
 
   const ordered: Uint8Array[] = [];
   for (let i = 0; i < transferState.totalPackets; i += 1) {
     const payload = transferState.receivedPackets.get(i);
     if (!payload) {
-      setStage('ERROR', 'Transfer Failed (Missing Packets)');
-      warningEl.textContent = 'Missing packets detected. Please restart sender.';
+      failTransfer('Transfer incomplete, restart sender', 'Missing packets detected during verification. Please restart sender.');
       return;
     }
     ordered.push(payload);
@@ -248,15 +247,13 @@ async function finalizeTransfer(): Promise<void> {
   const fileBytes = concatPayloads(ordered);
   const computedCrc = calculateCRC32(fileBytes);
   if (computedCrc !== transferState.fileCrc32) {
-    setStage('ERROR', 'Transfer Failed (CRC32 Mismatch)');
-    warningEl.textContent = 'File Corrupted. Retry transfer with slower frame rate.';
+    failTransfer('Decode error', 'File CRC32 mismatch detected. Retry transfer with slower frame rate.');
     lastPacketEl.textContent = `Expected CRC32 ${transferState.fileCrc32.toString(16)} got ${computedCrc.toString(16)}`;
     return;
   }
 
   if (transferState.expectedFileSize !== null && fileBytes.length !== transferState.expectedFileSize) {
-    setStage('ERROR', 'Transfer Failed (Size Mismatch)');
-    warningEl.textContent = 'File size mismatch detected. Please retry transfer.';
+    failTransfer('Transfer incomplete, restart sender', 'File size mismatch detected during verification. Please retry transfer.');
     return;
   }
 
@@ -282,10 +279,11 @@ async function finalizeTransfer(): Promise<void> {
 function failTransfer(message: string, warning: string): void {
   setStage('ERROR', message);
   warningEl.textContent = warning;
-  stopScanLoop(false);
+  stopScanLoop(true, false);
+  scanButton.textContent = 'Restart Scan';
 }
 
-function stopScanLoop(stopCamera = false): void {
+function stopScanLoop(stopCamera = false, resetToIdle = true): void {
   if (rafId) {
     cancelAnimationFrame(rafId);
     rafId = 0;
@@ -296,7 +294,9 @@ function stopScanLoop(stopCamera = false): void {
   }
   if (stopCamera) {
     stopCameraStream();
-    setStage('IDLE', 'Ready to scan');
+    if (resetToIdle) {
+      setStage('IDLE', 'Ready to scan');
+    }
     scanButton.textContent = 'Start Scan';
   }
 }
@@ -317,6 +317,20 @@ function updateSignalHealth(): void {
   if (transferState.endSeenAt && transferState.totalPackets !== null && transferState.receivedPackets.size < transferState.totalPackets && now - transferState.endSeenAt > END_GRACE_MS) {
     failTransfer('Transfer incomplete, restart sender', 'END frame seen before all packets were received.');
   }
+}
+
+
+function maybeFinalizeTransfer(): void {
+  if (panel.dataset.state === 'VERIFYING' || panel.dataset.state === 'SUCCESS' || panel.dataset.state === 'ERROR') return;
+  if (transferState.totalPackets === null) return;
+  const hasAllPackets = transferState.receivedPackets.size === transferState.totalPackets;
+  if (!hasAllPackets) return;
+
+  if (transferState.totalPackets === 0 && transferState.endSeenAt === null) {
+    return;
+  }
+
+  void finalizeTransfer();
 }
 
 function processFrame(now: number): void {
@@ -375,15 +389,14 @@ function processFrame(now: number): void {
         if (transferState.transferId && transferIdToKey(frame.transferId) === transferState.transferId) {
           transferState.endSeenAt = Date.now();
           logger.debug('[receiver] end frame observed for active transfer');
+          maybeFinalizeTransfer();
         }
       }
 
       lastPacketAt = Date.now();
       lastReceivedTimeEl.textContent = `Last packet: ${new Date(lastPacketAt).toLocaleTimeString()}`;
       updateProgress();
-      if (transferState.totalPackets !== null && transferState.receivedPackets.size === transferState.totalPackets) {
-        void finalizeTransfer();
-      }
+      maybeFinalizeTransfer();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown packet decode error.';
       logger.error('[receiver] packet validation failed', message);

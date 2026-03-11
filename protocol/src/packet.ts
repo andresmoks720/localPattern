@@ -225,7 +225,7 @@ export function chunkFile(file: Uint8Array, options: ChunkFileOptions = {}): Chu
   }
 
   const normalizedFileName = options.fileName?.trim() || 'unnamed.bin';
-  const totalPackets = Math.max(1, Math.ceil(file.length / maxPayloadSize));
+  const totalPackets = Math.ceil(file.length / maxPayloadSize);
   assertUint16(totalPackets, 'totalPackets');
 
   const transferId = options.transferId ?? createTransferId();
