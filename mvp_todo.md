@@ -14,8 +14,8 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 
 ## 1) Hard product limits
 
-- [ ] **Enforce sender hard cap at 1 MiB** (currently sender allows up to 10 MiB).
-- [ ] **Show warning at > 512 KiB** with MVP wording (“Large files may take a very long time and may fail more often.” or equivalent).
+- [x] **Enforce sender hard cap at 1 MiB** (currently sender allows up to 10 MiB).
+- [x] **Show warning at > 512 KiB** with MVP wording (“Large files may take a very long time and may fail more often.” or equivalent).
 - [ ] Ensure rejection happens **before packetization/transmission starts**.
 
 ---
@@ -28,8 +28,8 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] Document message formats and valid state transitions in protocol docs/spec notes.
 
 ### 2.1 Frame fields
-- [ ] Add `transferId` to **DATA** frame type, assembly, and parsing.
-- [ ] Include/validate **protocol version** explicitly per frame format (current parser mostly relies on magic bytes).
+- [x] Add `transferId` to **DATA** frame type, assembly, and parsing.
+- [x] Include/validate **protocol version** explicitly per frame format (current parser mostly relies on magic bytes).
 - [ ] Keep supported frame types exactly `HEADER`, `DATA`, `END` only.
 
 ### 2.5 Typed messages and explicit error classes
@@ -38,8 +38,8 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] Ensure protocol/state logic branches on error codes, while UI maps codes to user copy.
 
 ### 2.2 Transfer identity and lock isolation
-- [ ] Receiver must lock on first valid HEADER and then ignore all non-matching frames (including HEADER) until `SUCCESS`, `ERROR`, or manual reset.
-- [ ] Remove any behavior that auto-resets/merges when a different transfer is seen mid-attempt.
+- [x] Receiver must lock on first valid HEADER and then ignore all non-matching frames (including HEADER) until `SUCCESS`, `ERROR`, or manual reset.
+- [x] Remove any behavior that auto-resets/merges when a different transfer is seen mid-attempt.
 
 ### 2.3 Integrity
 - [ ] Preserve per-packet CRC32 validation for DATA.
@@ -47,8 +47,8 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] Ensure CRC failures are explicit user-visible error reasons (not silent).
 
 ### 2.4 Packet index validity
-- [ ] Explicitly ignore/reject DATA frames with index outside `0..totalPackets-1`.
-- [ ] Keep first valid payload for an index; duplicates must not overwrite.
+- [x] Explicitly ignore/reject DATA frames with index outside `0..totalPackets-1`.
+- [x] Keep first valid payload for an index; duplicates must not overwrite.
 
 ---
 
@@ -104,9 +104,9 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [ ] END frame alone must never be treated as success.
 
 ### 4.5 Fixed MVP timeout behavior
-- [ ] Implement fixed END grace window: **2000 ms**.
-- [ ] Implement fixed no-unique-progress timeout: **15000 ms**.
-- [ ] Track `lastUniquePacketAt` and do not let duplicates extend timeout.
+- [x] Implement fixed END grace window: **2000 ms**.
+- [x] Implement fixed no-unique-progress timeout: **15000 ms**.
+- [x] Track `lastUniquePacketAt` and do not let duplicates extend timeout.
 - [ ] On timeout/incomplete END, transition to terminal ERROR with actionable message.
 - [ ] Do not depend on sender runtime settings (frame duration/redundancy) unless explicitly in protocol metadata.
 
