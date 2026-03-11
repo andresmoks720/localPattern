@@ -7,6 +7,37 @@ export const FRAME_TYPE_HEADER = 0x01;
 export const FRAME_TYPE_DATA = 0x02;
 export const FRAME_TYPE_END = 0x03;
 
+
+export const PROTOCOL_ERROR_CODES = {
+  FRAME_TOO_SMALL: 'FRAME_TOO_SMALL',
+  VERSION_MISMATCH: 'VERSION_MISMATCH',
+  INVALID_MAGIC: 'INVALID_MAGIC',
+  UNSUPPORTED_VERSION: 'UNSUPPORTED_VERSION',
+  UNSUPPORTED_FRAME_TYPE: 'UNSUPPORTED_FRAME_TYPE',
+  MALFORMED_HEADER: 'MALFORMED_HEADER',
+  MALFORMED_DATA: 'MALFORMED_DATA',
+  MALFORMED_END: 'MALFORMED_END',
+  PACKET_CRC_MISMATCH: 'PACKET_CRC_MISMATCH',
+  INVALID_TRANSFER_ID: 'INVALID_TRANSFER_ID',
+  INVALID_UINT16: 'INVALID_UINT16',
+  INVALID_UINT32: 'INVALID_UINT32',
+  INVALID_MAX_PAYLOAD_SIZE: 'INVALID_MAX_PAYLOAD_SIZE',
+  INVALID_FILE_NAME: 'INVALID_FILE_NAME',
+  PACKET_BOUNDS: 'PACKET_BOUNDS'
+} as const;
+
+export type ProtocolErrorCode = (typeof PROTOCOL_ERROR_CODES)[keyof typeof PROTOCOL_ERROR_CODES];
+
+export class ProtocolError extends Error {
+  public readonly code: ProtocolErrorCode;
+
+  public constructor(code: ProtocolErrorCode, message: string) {
+    super(message);
+    this.name = 'ProtocolError';
+    this.code = code;
+  }
+}
+
 export interface TransferHeaderFrame {
   frameType: typeof FRAME_TYPE_HEADER;
   transferId: Uint8Array;

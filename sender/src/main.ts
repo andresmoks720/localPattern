@@ -1,6 +1,6 @@
 import './style.css';
 import QRCode from 'qrcode';
-import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, assembleFrame, chunkFile, type TransferFrame } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, PROTOCOL_ERROR_CODES, ProtocolError, assembleFrame, chunkFile, type TransferFrame } from '@qr-data-bridge/protocol';
 
 const QR_PREFIX = 'QDB64:';
 const SETTINGS_KEY = 'qdb_sender_settings_v2';
@@ -18,6 +18,42 @@ const logger = {
 };
 
 let sharedAudioContext: AudioContext | null = null;
+
+
+function asErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+
+function toUserFacingSenderError(error: unknown): { title: string; warning: string } {
+  if (error instanceof ProtocolError) {
+    if (error.code === PROTOCOL_ERROR_CODES.INVALID_FILE_NAME) {
+      return {
+        title: `Error: filename limit exceeded: ${error.message}`,
+        warning: 'Rename the file to a shorter UTF-8 name and try again.'
+      };
+    }
+
+    if (error.code === PROTOCOL_ERROR_CODES.PACKET_BOUNDS) {
+      return {
+        title: `Error: too many packets: ${error.message}`,
+        warning: 'Increase chunk size or pick a smaller file.'
+      };
+    }
+
+    return {
+      title: `Error: packetization failed: ${error.message}`,
+      warning: 'Adjust settings and retry transmission.'
+    };
+  }
+
+  const message = asErrorMessage(error, 'Packetization failed.');
+  return {
+    title: `Error: packetization failed: ${message}`,
+    warning: 'Adjust settings and retry transmission.'
+  };
+}
+
 
 type SenderStage = 'NO_FILE' | 'READY' | 'COUNTDOWN' | 'TRANSMITTING' | 'COMPLETE' | 'ERROR';
 
@@ -208,6 +244,7 @@ let countdownTimer: number | null = null;
 let isTransmitting = false;
 let wakeLock: WakeLockSentinel | null = null;
 let senderStage: SenderStage = 'NO_FILE';
+let totalDataPackets = 0;
 
 
 function setSenderStage(stage: SenderStage, message?: string): void {
@@ -232,7 +269,7 @@ function estimatedSpeedBytesPerSec(): number {
 function frameLabel(frame: TransferFrame): string {
   if (frame.frameType === FRAME_TYPE_HEADER) return 'HEADER';
   if (frame.frameType === FRAME_TYPE_END) return 'END';
-  return `DATA #${frame.packetIndex + 1}`;
+  return `packet ${frame.packetIndex + 1}/${totalDataPackets}`;
 }
 
 function refreshEstimates(): void {
@@ -271,6 +308,7 @@ function rebuildFrames(): void {
   if (!fileBytes) return;
   const transfer = chunkFile(fileBytes, { fileName: selectedFileName, maxPayloadSize: effectiveChunkSize(), includeEndFrame: true });
   transmissionFrames = [transfer.header, ...transfer.dataFrames, ...(transfer.endFrame ? [transfer.endFrame] : [])];
+  totalDataPackets = transfer.dataFrames.length;
   const nextStreamFrames: TransferFrame[] = [];
   for (const frame of transmissionFrames) {
     if (frame.frameType === FRAME_TYPE_DATA) {
@@ -287,7 +325,17 @@ function rebuildFrames(): void {
 function persistAndRefresh(): void {
   saveSettings(settings);
   updateSettingsUi();
-  rebuildFrames();
+  try {
+    rebuildFrames();
+  } catch (error) {
+    transmissionFrames = [];
+    streamFrames = [];
+    totalDataPackets = 0;
+    const userFacing = toUserFacingSenderError(error);
+    setSenderStage('ERROR', userFacing.title);
+    warningMeta.textContent = userFacing.warning;
+    startButton.disabled = true;
+  }
 }
 
 function setWakeLockWarning(message: string): void {
@@ -336,7 +384,9 @@ async function renderFrame(index: number): Promise<void> {
     margin: 1,
     color: { dark: '#000000', light: '#FFFFFF' }
   });
-  packetMeta.textContent = `Sending ${frameLabel(frame)} • scan ${index + 1}/${streamFrames.length}`;
+  packetMeta.textContent = frame.frameType === FRAME_TYPE_DATA
+    ? `Sending ${frameLabel(frame)}`
+    : `Sending ${frameLabel(frame)} • scan ${index + 1}/${streamFrames.length}`;
   if (settings.soundEnabled) playClickSound();
   logger.debug('[sender] rendered', { index });
 }
@@ -347,7 +397,7 @@ function scheduleNextFrame(): void {
     if (!isTransmitting) return;
     const nextIndex = currentStreamIndex + 1;
     if (nextIndex >= streamFrames.length) {
-      stopTransmission('Transmission finished.', 'COMPLETE');
+      stopTransmission('Transmission finished. If receiver did not complete, restart sender.', 'COMPLETE');
       return;
     }
     currentStreamIndex = nextIndex;
@@ -430,6 +480,7 @@ fileInput.addEventListener('change', async () => {
   if (!selectedFile) {
     transmissionFrames = [];
     streamFrames = [];
+    totalDataPackets = 0;
     fileBytes = null;
     selectedFileName = '';
     fileMeta.textContent = 'No file selected.';
@@ -442,6 +493,7 @@ fileInput.addEventListener('change', async () => {
   if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
     transmissionFrames = [];
     streamFrames = [];
+    totalDataPackets = 0;
     fileBytes = null;
     selectedFileName = '';
     fileMeta.textContent = 'File too large (1 MiB max).';
@@ -451,9 +503,39 @@ fileInput.addEventListener('change', async () => {
     return;
   }
 
-  fileBytes = new Uint8Array(await selectedFile.arrayBuffer());
+  try {
+    fileBytes = new Uint8Array(await selectedFile.arrayBuffer());
+  } catch (error) {
+    transmissionFrames = [];
+    streamFrames = [];
+    totalDataPackets = 0;
+    fileBytes = null;
+    selectedFileName = '';
+    fileMeta.textContent = 'Error reading file.';
+    setSenderStage('ERROR', `Error: file read failed: ${asErrorMessage(error, 'Unable to read selected file.')}`);
+    warningMeta.textContent = 'Try re-selecting the file and restart transmission.';
+    startButton.disabled = true;
+    return;
+  }
+
   selectedFileName = selectedFile.name;
-  rebuildFrames();
+
+  try {
+    rebuildFrames();
+  } catch (error) {
+    transmissionFrames = [];
+    streamFrames = [];
+    totalDataPackets = 0;
+    fileBytes = null;
+    selectedFileName = '';
+    const userFacing = toUserFacingSenderError(error);
+    fileMeta.textContent = userFacing.title.includes('filename') ? 'Filename cannot be encoded within protocol limits.' : 'Packetization failed.';
+    setSenderStage('ERROR', userFacing.title);
+    warningMeta.textContent = userFacing.warning;
+    startButton.disabled = true;
+    return;
+  }
+
   currentStreamIndex = 0;
   setSenderStage('READY', 'Ready to transmit');
   startButton.disabled = false;
@@ -476,6 +558,7 @@ resetButton.addEventListener('click', () => {
   stopTransmission('No file selected', 'NO_FILE');
   transmissionFrames = [];
   streamFrames = [];
+  totalDataPackets = 0;
   fileBytes = null;
   selectedFileName = '';
   fileInput.value = '';
