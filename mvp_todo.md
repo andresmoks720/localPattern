@@ -107,12 +107,12 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [x] Implement fixed END grace window: **2000 ms**.
 - [x] Implement fixed no-unique-progress timeout: **15000 ms**.
 - [x] Track `lastUniquePacketAt` and do not let duplicates extend timeout.
-- [ ] On timeout/incomplete END, transition to terminal ERROR with actionable message.
+- [x] On timeout/incomplete END, transition to terminal ERROR with actionable message.
 - [ ] Do not depend on sender runtime settings (frame duration/redundancy) unless explicitly in protocol metadata.
 
 ### 4.6 Post-failure behavior
-- [ ] After terminal failure, keep explicit ERROR state until user restart/reset.
-- [ ] Do not silently continue receiving into failed attempt.
+- [x] After terminal failure, keep explicit ERROR state until user restart/reset.
+- [x] Do not silently continue receiving into failed attempt.
 
 ### 4.7 Zero-byte files
 - [ ] Support zero-byte files with deterministic behavior (explicit success/failure path, no hangs).
