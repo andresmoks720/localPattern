@@ -1,7 +1,8 @@
 # MVPv2 TODO — Full Implementation Gap List (Deep Pass)
 
-This file is a **comprehensive implementation checklist** against `mvp.md`.
+This file is a **comprehensive implementation checklist** against the normative spec in `mvp.md`.
 It is intentionally exhaustive so we do not miss hidden gaps.
+It is backlog/gap-tracking material, not normative protocol text.
 
 Legend:
 - `[x]` done / aligned
@@ -17,7 +18,7 @@ Legend:
 - [x] No WebSocket/BLE/audio return channel implementation.
 - [x] No automatic resend-until-success loop.
 - [x] No multi-file queue/resume flow.
-- [~] Remove or gate MVPv2-incompatible reliability knobs (currently includes DATA redundancy multiplier).
+- [ ] Freeze redundancy policy for MVPv2 (not user-tunable; fixed sender-side emission constant documented).
 - [ ] Add explicit “MVPv2 one-way mode” guard in code/docs so future two-way code cannot leak into this flow.
 - [ ] Add static checks/tests ensuring no hidden dormant backchannel message types appear in protocol package.
 
@@ -41,7 +42,7 @@ Legend:
 ### B3. No late-join guarantee / no automatic recovery
 - [x] UI already tells users to restart sender on incomplete transfer.
 - [x] No retransmit request protocol present.
-- [ ] Remove redundancy scans in MVPv2 mode to avoid implicit recovery behavior.
+- [ ] Ensure redundancy, if present, is fixed non-adaptive sender policy and not recovery behavior in MVPv2 mode.
 
 ---
 
@@ -66,6 +67,8 @@ Legend:
 - [x] Big-endian unsigned reads/writes used via DataView.
 
 ### D2. **Critical wire-layout mismatches to fix**
+- [ ] Add `headerCrc32(4)` to HEADER wire layout and parser.
+- [ ] Validate HEADER only when `headerCrc32` matches required coverage.
 - [ ] Remove extra protocol version byte from all frames.
   - Current implementation encodes `magic|type|version|...`.
   - Spec requires `magic|type|...` only.
@@ -100,6 +103,9 @@ Legend:
 ---
 
 ## E. CRC and Integrity Semantics
+
+- [ ] Lock CRC variant everywhere to `CRC-32/IEEE 802.3` (poly `0x04C11DB7`, reflected in/out, init/final xor `0xFFFFFFFF`, BE serialization).
+- [ ] Add explicit empty-input CRC regression (`0x00000000`).
 
 ### E1. Packet CRC coverage (critical mismatch)
 - [ ] Change packet CRC coverage to exactly: `transferId(8) + packetIndex(2) + payload(n)`.
@@ -150,6 +156,7 @@ Legend:
 - [ ] Fail before transmission when chosen settings cannot encode frames.
 
 ### H2. Transmission mode
+- [ ] Freeze MVPv2 sender timing to one fixed DATA frame duration default and remove advanced timing UI knobs.
 - [x] One pass through current stream.
 - [~] DATA redundancy repeats frames (`redundancyCount`), deviates from strict `HEADER->DATA in order->END` once each.
 - [x] No backchannel waiting.
@@ -162,6 +169,7 @@ Legend:
 - [ ] Add tests with fake timers for HEADER/END hold semantics.
 
 ### H4. Final screen sequencing
+- [ ] Ensure estimate includes HEADER hold + all DATA intervals + END hold (optional countdown may be excluded).
 - [~] END is shown as part of sequence, but explicit timed hold before completion is not guaranteed.
 - [ ] Enforce exact order: transmit END -> hold END -> then final non-QR screen.
 
@@ -207,7 +215,7 @@ Legend:
 - [x] CRC-invalid DATA ignored without terminal failure.
 
 ### I3. Completion rule (major gap)
-- [ ] Require END as part of success condition.
+- [x] Non-empty file success does not require END; END remains required for zero-byte completion and timeout signaling.
 - [x] Full packet set + file reassembly + CRC + file size currently required.
 - [ ] For zero-byte case, wait for END before success.
 
@@ -319,6 +327,8 @@ Legend:
 ---
 
 ## N. Dependency, Packaging, and Transport Rules
+
+- [ ] Clarify docs that binary frame layout is authoritative and QR-safe text encoding is transport-only reversible wrapper.
 
 - [x] No remote CDN dependency in runtime path.
 - [x] Browser-only static app packaging via Vite.
