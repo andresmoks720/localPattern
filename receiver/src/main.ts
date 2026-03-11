@@ -5,6 +5,8 @@ import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, calculateCRC32, par
 const QR_PREFIX = 'QDB64:';
 const SCAN_INTERVAL_MS = 300;
 const SIGNAL_LOST_MS = 5000;
+const END_GRACE_WINDOW_MS = 2000;
+const NO_UNIQUE_PROGRESS_TIMEOUT_MS = 15000;
 const THEME_KEY = 'qdb_theme';
 
 const logger = {
@@ -161,9 +163,12 @@ let lastDecodedPayload = '';
 let lastScanAt = 0;
 let scanStartedAt = 0;
 let lastPacketAt = 0;
+let lastUniquePacketAt = 0;
+let endSeenAt: number | null = null;
 let transferState = createTransferState();
 let downloadUrl: string | null = null;
 let soundEnabled = false;
+let currentStage: ReceiverStage = 'IDLE';
 
 function setTheme(theme: 'dark' | 'light'): void {
   document.documentElement.dataset.theme = theme;
@@ -171,6 +176,7 @@ function setTheme(theme: 'dark' | 'light'): void {
 }
 
 function setStage(stage: ReceiverStage, message: string): void {
+  currentStage = stage;
   panel.dataset.state = stage;
   statusEl.textContent = message;
 }
@@ -204,14 +210,21 @@ function resetTransferState(clearWarning = true): void {
   revokeDownloadUrl();
   downloadButton.disabled = true;
   lastPacketAt = 0;
+  lastUniquePacketAt = 0;
+  endSeenAt = null;
   lastReceivedTimeEl.textContent = 'Last packet: -';
 }
 
 function applyHeaderFrame(header: TransferHeaderFrame): void {
   const incomingTransferId = transferIdToKey(header.transferId);
-  if (transferState.headerReceived && transferState.transferId && transferState.transferId !== incomingTransferId) {
-    warningEl.textContent = 'Sender restarted. Session reset automatically.';
-    transferState = createTransferState();
+  if (transferState.headerReceived) {
+    if (transferState.transferId !== incomingTransferId) {
+      logger.debug('[receiver] ignoring header for non-active transfer', incomingTransferId);
+      return;
+    }
+
+    logger.debug('[receiver] duplicate header observed for active transfer');
+    return;
   }
 
   transferState.headerReceived = true;
@@ -220,21 +233,30 @@ function applyHeaderFrame(header: TransferHeaderFrame): void {
   transferState.expectedFileSize = header.fileSize;
   transferState.totalPackets = header.totalPackets;
   transferState.fileCrc32 = header.fileCrc32;
+  lastUniquePacketAt = Date.now();
   setStage('RECEIVING', 'Header received. Listening for packets...');
   lastPacketEl.textContent = `${transferState.fileName} • ${header.fileSize} bytes • ${header.totalPackets} packets`;
 }
 
+function failTransfer(statusMessage: string, warningMessage: string, detail?: string): void {
+  setStage('ERROR', statusMessage);
+  warningEl.textContent = warningMessage;
+  if (detail) {
+    lastPacketEl.textContent = detail;
+  }
+  stopScanLoop(true, true);
+}
+
 async function finalizeTransfer(): Promise<void> {
   if (!transferState.totalPackets || transferState.fileCrc32 === null) return;
+  if (currentStage === 'VERIFYING' || currentStage === 'SUCCESS') return;
   setStage('VERIFYING', 'Verifying...');
 
   const ordered: Uint8Array[] = [];
   for (let i = 0; i < transferState.totalPackets; i += 1) {
     const payload = transferState.receivedPackets.get(i);
     if (!payload) {
-      setStage('ERROR', 'Transfer Failed (Missing Packets)');
-      warningEl.textContent = 'Missing packets detected. Please restart sender.';
-      resetTransferState(false);
+      failTransfer('Transfer Failed (Missing Packets)', 'Missing packets detected. Please restart sender.');
       return;
     }
     ordered.push(payload);
@@ -243,17 +265,16 @@ async function finalizeTransfer(): Promise<void> {
   const fileBytes = concatPayloads(ordered);
   const computedCrc = calculateCRC32(fileBytes);
   if (computedCrc !== transferState.fileCrc32) {
-    setStage('ERROR', 'Transfer Failed (CRC32 Mismatch)');
-    warningEl.textContent = 'File Corrupted. Retry transfer with slower frame rate.';
-    lastPacketEl.textContent = `Expected CRC32 ${transferState.fileCrc32.toString(16)} got ${computedCrc.toString(16)}`;
-    resetTransferState(false);
+    failTransfer(
+      'Transfer Failed (CRC32 Mismatch)',
+      'File Corrupted. Retry transfer with slower frame rate.',
+      `Expected CRC32 ${transferState.fileCrc32.toString(16)} got ${computedCrc.toString(16)}`
+    );
     return;
   }
 
   if (transferState.expectedFileSize !== null && fileBytes.length !== transferState.expectedFileSize) {
-    setStage('ERROR', 'Transfer Failed (Size Mismatch)');
-    warningEl.textContent = 'File size mismatch detected. Please retry transfer.';
-    resetTransferState(false);
+    failTransfer('Transfer Failed (Size Mismatch)', 'File size mismatch detected. Please retry transfer.');
     return;
   }
 
@@ -275,7 +296,7 @@ async function finalizeTransfer(): Promise<void> {
   if (soundEnabled) playDing();
 }
 
-function stopScanLoop(stopCamera = false): void {
+function stopScanLoop(stopCamera = false, preserveStage = false): void {
   if (rafId) {
     cancelAnimationFrame(rafId);
     rafId = 0;
@@ -286,17 +307,35 @@ function stopScanLoop(stopCamera = false): void {
   }
   if (stopCamera) {
     stopCameraStream();
-    setStage('IDLE', 'Ready to scan');
+    if (!preserveStage) {
+      setStage('IDLE', 'Ready to scan');
+    }
     scanButton.textContent = 'Start Scan';
   }
 }
 
 function updateSignalHealth(): void {
-  if (panel.dataset.state !== 'SCANNING' && panel.dataset.state !== 'RECEIVING') return;
+  if (currentStage !== 'SCANNING' && currentStage !== 'RECEIVING') return;
   const now = Date.now();
   const reference = lastPacketAt > 0 ? lastPacketAt : scanStartedAt;
   if (reference > 0 && now - reference > SIGNAL_LOST_MS) {
     warningEl.textContent = 'Signal Lost - Check Alignment';
+  }
+
+  if (
+    currentStage === 'RECEIVING' &&
+    transferState.headerReceived &&
+    transferState.totalPackets !== null &&
+    transferState.receivedPackets.size < transferState.totalPackets
+  ) {
+    if (endSeenAt !== null && now - endSeenAt >= END_GRACE_WINDOW_MS) {
+      failTransfer('Transfer Failed (Incomplete END)', 'Transfer incomplete, restart sender.');
+      return;
+    }
+
+    if (lastUniquePacketAt > 0 && now - lastUniquePacketAt >= NO_UNIQUE_PROGRESS_TIMEOUT_MS) {
+      failTransfer('Transfer Failed (No Progress)', 'No unique packets received for 15 seconds. Restart sender.');
+    }
   }
 }
 
@@ -327,19 +366,46 @@ function processFrame(now: number): void {
         applyHeaderFrame(frame);
       } else if (frame.frameType === FRAME_TYPE_DATA) {
         if (!transferState.headerReceived || transferState.totalPackets === null) {
-          warningEl.textContent = 'Waiting for header frame. Restart sender if needed.';
+          logger.debug('[receiver] ignoring data frame before header');
           updateProgress();
           rafId = requestAnimationFrame(processFrame);
           return;
         }
-        if (frame.packetIndex < transferState.totalPackets && !transferState.receivedPackets.has(frame.packetIndex)) {
+        if (frame.packetIndex < 0 || frame.packetIndex >= transferState.totalPackets) {
+          logger.debug('[receiver] ignoring out-of-range packet index', frame.packetIndex);
+          rafId = requestAnimationFrame(processFrame);
+          return;
+        }
+
+        if (!transferState.receivedPackets.has(frame.packetIndex)) {
           transferState.receivedPackets.set(frame.packetIndex, frame.payload);
+          lastUniquePacketAt = Date.now();
+          endSeenAt = null;
+        } else {
+          logger.debug('[receiver] duplicate packet ignored', frame.packetIndex);
         }
 
         setStage('RECEIVING', 'Listening for packets...');
         lastPacketEl.textContent = `Packet ${frame.packetIndex + 1}/${transferState.totalPackets} received.`;
       } else if (frame.frameType === FRAME_TYPE_END) {
+        if (!transferState.headerReceived || transferState.transferId === null) {
+          logger.debug('[receiver] ignoring end frame before header');
+          rafId = requestAnimationFrame(processFrame);
+          return;
+        }
+
+        const endTransferId = transferIdToKey(frame.transferId);
+        if (endTransferId !== transferState.transferId) {
+          logger.debug('[receiver] ignoring end frame for non-active transfer', endTransferId);
+          rafId = requestAnimationFrame(processFrame);
+          return;
+        }
+
         logger.debug('[receiver] end frame observed', frame.transferId);
+        if (transferState.totalPackets !== null && transferState.receivedPackets.size < transferState.totalPackets) {
+          endSeenAt = Date.now();
+          warningEl.textContent = 'END received, waiting for missing packets...';
+        }
       }
 
       lastPacketAt = Date.now();
@@ -350,9 +416,8 @@ function processFrame(now: number): void {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown packet decode error.';
-      setStage('ERROR', 'Transfer Failed (Decode Error)');
-      lastPacketEl.textContent = message;
-      logger.error('[receiver] packet validation failed', message);
+      warningEl.textContent = 'Decode error. Keep devices steady and aligned.';
+      logger.error('[receiver] packet ignored', message);
     }
   }
 
