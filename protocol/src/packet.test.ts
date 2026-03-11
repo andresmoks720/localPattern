@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferEndFrame, type TransferHeaderFrame } from './types';
 import { assembleFrame, chunkFile, parseFrame } from './packet';
+import { calculateCRC32 } from './crc32';
 
 function transferId(): Uint8Array {
   return new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -42,6 +43,16 @@ describe('protocol framing', () => {
     const transfer = chunkFile(payload, { transferId: transferId(), includeEndFrame: true, maxPayloadSize: 2 });
     const bad = { ...transfer.dataFrames[0], packetCrc32: 1 };
     expect(() => assembleFrame(bad)).toThrow(/packetCrc32 mismatch/i);
+  });
+
+
+
+  it('full-file CRC32 mismatch rejected', () => {
+    const source = new Uint8Array([10, 20, 30, 40]);
+    const transfer = chunkFile(source, { transferId: transferId(), maxPayloadSize: 2 });
+    const tampered = source.slice();
+    tampered[0] = 99;
+    expect(calculateCRC32(tampered)).not.toBe(transfer.header.fileCrc32);
   });
 
   it('wrong protocol magic/version rejected', () => {

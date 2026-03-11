@@ -52,3 +52,8 @@ export function decideTimeoutHandling(params: {
 
   return 'none';
 }
+
+export function shouldFinalizeTransfer(params: { totalPackets: number | null; receivedPacketsCount: number }): boolean {
+  const { totalPackets, receivedPacketsCount } = params;
+  return totalPackets !== null && receivedPacketsCount === totalPackets;
+}

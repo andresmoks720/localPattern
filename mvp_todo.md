@@ -148,7 +148,7 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [x] DATA roundtrip parse/assemble
 - [x] END roundtrip parse/assemble
 - [x] DATA CRC32 mismatch rejected
-- [ ] full-file CRC32 mismatch rejected
+- [x] full-file CRC32 mismatch rejected
 - [x] wrong protocol magic/version rejected
 - [x] `transferId` required and validated
 - [x] DATA with wrong `transferId` ignored by receiver logic
@@ -166,7 +166,7 @@ This checklist compares the current codebase to `mvp.md` and lists the remaining
 - [x] duplicate DATA does not corrupt state
 - [x] END with incomplete packet set becomes terminal failure
 - [x] no unique progress timeout becomes terminal failure
-- [ ] full packet set + matching CRC becomes success
+- [x] full packet set + matching CRC becomes success
 - [x] out-of-range packet index handling verified
 - [x] zero-byte file deterministic completion verified
 

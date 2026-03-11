@@ -1,7 +1,7 @@
 import './style.css';
 import jsQR from 'jsqr';
 import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, calculateCRC32, parseFrame, type TransferHeaderFrame } from '@qr-data-bridge/protocol';
-import { decideDataFrameHandling, decideTimeoutHandling } from './receiverRules';
+import { decideDataFrameHandling, decideTimeoutHandling, shouldFinalizeTransfer } from './receiverRules';
 
 const QR_PREFIX = 'QDB64:';
 const SCAN_INTERVAL_MS = 300;
@@ -444,7 +444,7 @@ function processFrame(now: number): void {
       lastPacketAt = Date.now();
       lastReceivedTimeEl.textContent = `Last packet: ${new Date(lastPacketAt).toLocaleTimeString()}`;
       updateProgress();
-      if (transferState.totalPackets !== null && transferState.receivedPackets.size === transferState.totalPackets) {
+      if (shouldFinalizeTransfer({ totalPackets: transferState.totalPackets, receivedPacketsCount: transferState.receivedPackets.size })) {
         void finalizeTransfer();
       }
     } catch (error) {

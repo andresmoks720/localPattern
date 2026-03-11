@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideDataFrameHandling, decideTimeoutHandling } from './receiverRules';
+import { decideDataFrameHandling, decideTimeoutHandling, shouldFinalizeTransfer } from './receiverRules';
 
 describe('receiver rules', () => {
   it('DATA before HEADER ignored', () => {
@@ -82,6 +82,14 @@ describe('receiver rules', () => {
         noUniqueProgressTimeoutMs: 15000
       })
     ).toBe('no-unique-progress');
+  });
+
+
+
+  it('full packet set + matching CRC becomes success readiness', () => {
+    expect(shouldFinalizeTransfer({ totalPackets: 3, receivedPacketsCount: 3 })).toBe(true);
+    expect(shouldFinalizeTransfer({ totalPackets: 3, receivedPacketsCount: 2 })).toBe(false);
+    expect(shouldFinalizeTransfer({ totalPackets: null, receivedPacketsCount: 0 })).toBe(false);
   });
 
   it('zero-byte file deterministic completion timeout path verified', () => {
