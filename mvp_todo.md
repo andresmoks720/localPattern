@@ -29,7 +29,7 @@ Legend:
 ### B1. File size enforcement
 - [x] Sender rejects file > 1 MiB before transmit.
 - [x] Rejection is user-visible.
-- [x] File warning copy for >512 KiB should match spec wording exactly.
+- [x] File warning copy for >512 KiB matches spec wording exactly.
 - [x] Add test asserting exact warning copy bucket for >512 KiB.
 
 ### B2. One active transfer per receiver
@@ -50,8 +50,8 @@ Legend:
 
 - [x] Core frame assembly/parsing lives in `protocol` package.
 - [x] Receiver state machine is in protocol module, not in DOM.
-- [x] Sender transmission state logic is still UI-heavy in `sender/main.ts`.
-- [x] Receiver scan ingestion + UI state rendering is still tightly coupled in `receiver/main.ts`.
+- [x] Sender transmission state logic extracted into `senderCore` + `transmissionService`, with `sender/main.ts` kept as orchestration/UI wiring.
+- [x] Receiver scan ingestion extracted into `receiver/ingestService`, with `receiver/main.ts` focused on scanner lifecycle + UI wiring.
 - [x] Extract sender transmission service module (preflight, stream scheduling, state transitions).
 - [x] Extract receiver ingest service module (scanner ingress queue, dedupe strategy, machine events).
 - [x] Add protocol transition/state docs outside view code.
@@ -138,11 +138,11 @@ Legend:
 
 ## G. Zero-byte File Contract (critical mismatch)
 
-- [x] `chunkFile` should emit `totalPackets=0` for empty file (currently forces at least one packet).
-- [x] Sender should emit only `HEADER -> END` for empty file.
+- [x] `chunkFile` emits `totalPackets=0` for empty files (no forced DATA packet).
+- [x] Sender emits only `HEADER -> END` for empty files.
 - [x] Sender must not emit DATA for empty files.
 - [x] Receiver must not complete on HEADER alone when `totalPackets=0`.
-- [x] Receiver should require END + zero-byte verification for success.
+- [x] Receiver requires END + zero-byte verification for success.
 - [x] Add dedicated zero-byte protocol fixtures and regression tests.
 
 ---
@@ -169,7 +169,7 @@ Legend:
 - [x] Add tests with fake timers for HEADER/END hold semantics.
 
 ### H4. Final screen sequencing
-- [x] Ensure estimate includes HEADER hold + all DATA intervals + END hold (optional countdown may be excluded).
+- [x] Estimate includes HEADER hold + all DATA intervals + END hold.
 - [x] END is shown and held before completion.
 - [x] Enforce exact order: transmit END -> hold END -> then final non-QR screen.
 
@@ -185,7 +185,7 @@ Legend:
 - [x] Filename limit issues surfaced.
 - [x] QR encode failure surfaced.
 - [x] Explicit “frame precompute failure” bucket is distinguished and user-visible.
-- [x] Explicit “invalid preflight settings” bucket not distinguished.
+- [x] Explicit “invalid preflight settings” bucket is distinguished and user-visible.
 - [x] Add complete error-code -> user-copy map and assert in tests.
 
 ### H7. Abort/reset lifecycle
@@ -216,23 +216,23 @@ Legend:
 
 ### I3. Completion rule (major gap)
 - [x] Non-empty file success does not require END; END remains required for zero-byte completion and timeout signaling.
-- [x] Full packet set + file reassembly + CRC + file size currently required.
+- [x] Full packet set + file reassembly + CRC + file size are required for non-empty success.
 - [x] For zero-byte case, wait for END before success.
 
 ### I4. Failure rules
 - [x] END-incomplete grace timeout implemented (2000ms).
 - [x] No-unique-progress timeout implemented (15000ms).
 - [x] Duplicate packets do not reset unique-progress timer.
-- [x] Timeout copy should match spec exactly for incomplete transfer bucket.
+- [x] Timeout copy matches spec wording exactly for the incomplete-transfer bucket.
 
 ### I5. Scanner dedupe vs protocol dedupe
-- [x] Scanner ingress dedupe currently implemented with `lastDecodedPayload` equality only.
+- [x] Scanner ingress dedupe is bounded/time-aware and no longer relies on unbounded `lastDecodedPayload` equality.
 - [x] Make scanner dedupe bounded-time/noise-oriented (not unbounded “last payload forever”).
 - [x] Keep protocol dedupe independent and explicitly tested.
 - [x] Add tests showing protocol correctness unaffected when scanner dedupe is disabled.
 
 ### I6. Queue/ingest discipline
-- [x] Ingestion is single callback path today, but lacks explicit queue abstraction.
+- [x] Ingestion uses an explicit serialized queue abstraction to prevent concurrent state mutation during burst scanner callbacks.
 - [x] Introduce serialized ingest queue/channel to avoid concurrent state mutation risks.
 - [x] Add tests for deterministic ordering under burst scanner callbacks.
 
@@ -274,7 +274,7 @@ Legend:
 - [x] Starting in…
 - [x] Sending packet X/N.
 - [x] Transmission finished.
-- [x] Actionable error copy present but not fully normalized to spec buckets.
+- [x] Actionable sender error copy is normalized to spec-aligned buckets via the sender error-code mapping.
 
 ### K2. Receiver required copy buckets
 - [x] Ready to scan.
@@ -284,14 +284,14 @@ Legend:
 - [x] File ready.
 - [x] Transfer incomplete, restart sender.
 - [x] Decode/camera/corruption error buckets present.
-- [x] Normalize all timeout/incomplete copy exactly per spec recommendation where practical.
+- [x] Timeout/incomplete copy is normalized to the spec-recommended wording.
 
 ### K3. Operator guidance
 - [x] Some practical hints exist.
 - [x] Ensure all key hints appear in concise form: steady devices, QR fully visible, move closer, fullscreen mode, larger files slower.
 
 ### K4. Stable visual geometry
-- [x] QR and scan overlays are generally stable/square.
+- [x] QR and scan overlays are stable/square during transfer.
 - [x] Audit CSS/layout to guarantee no transfer-time layout shifts.
 - [x] Add smoke test or visual regression check for stable QR area during transmission.
 
@@ -322,7 +322,7 @@ Legend:
 - [x] Clears raf/interval timers.
 - [x] Clears packet store and transferId via machine reset.
 - [x] Clears download Blob URL.
-- [x] Add explicit cleanup for attempt diagnostics/counters if introduced.
+- [x] Explicit cleanup is defined for attempt diagnostics/counters.
 
 ---
 
@@ -362,6 +362,7 @@ Legend:
 - [x] conflicting same-transfer HEADER metadata terminal error tests.
 - [x] END-before-HEADER ignored tests.
 - [x] zero-byte wire contract tests.
+- [x] End-to-end protocol integration tests cover `chunkFile -> assembleFrame -> parseFrame -> ReceiverMachine` for success, corruption/drop tolerance, and END-timeout semantics.
 
 ### P2. Sender tests
 - [x] >1 MiB rejected.
@@ -392,11 +393,12 @@ Legend:
 - [x] repeated matching control-frame no-op tests.
 - [x] terminal ERROR blocks further ingestion tests (broad coverage).
 - [x] scanner-ingress dedupe vs protocol dedupe separation tests.
+- [x] Sender-to-receiver integration tests validate sender-built frame streams through receiver ingest queue (success path, zero-byte flow, bad-CRC recovery, noise/duplicate scans, foreign-frame interleaving, and END-incomplete timeout).
 
 ### P4. Empty-file dedicated coverage
 - [x] Sender emits deterministic HEADER->END only.
 - [x] Receiver deterministic zero-byte verify success/failure reasons.
-- [x] No hang waiting for missing DATA.
+- [x] Receiver does not hang waiting for missing DATA in empty-file flow.
 
 ### P5. Manual real-device matrix (recording required)
 - [x] phone->phone
@@ -438,10 +440,10 @@ Legend:
 - [x] preflight settings validation before transmission is complete.
 - [x] receiver success rule aligned: END required for zero-byte completion; non-empty succeeds on verified full packet set.
 - [x] zero-byte path deterministic per spec.
-- [x] manual retry fresh attempt behavior mostly present.
-- [x] QR visual stability mostly present; needs explicit guarantees/tests.
+- [x] Manual retry fresh-attempt behavior is deterministic (new transferId + rebuilt frame stream).
+- [x] QR visual stability is explicitly guaranteed and covered by sender layout stability tests.
 - [x] sender interruption hidden-page behavior stops transfer.
-- [x] core transport/state partly testable outside UI; sender/receiver app files still too orchestration-heavy.
+- [x] Core transport/state is testable outside UI with sender/receiver services and dedicated protocol/service tests; app entrypoints remain orchestration-focused by design.
 - [x] no major out-of-scope features added.
 
 ---
@@ -453,3 +455,11 @@ Legend:
 3. **Sender correctness**: preflight QR validation, control-frame holds, remove redundancy in MVPv2 mode.
 4. **Tests + CI**: add exhaustive protocol/sender/receiver tests and hygiene guards.
 5. **Boundary hardening**: split service/state logic from UI and document transitions.
+
+---
+
+## T. Completion Verification (against `mvp.md` + roadmap)
+
+- [x] Revalidated all TODO sections against `mvp.md` normative MVPv2 constraints.
+- [x] Revalidated execution sequencing/coverage against `mvp_roadmap.md` phases.
+- [x] Ran full CI test gate (`ci:check-focused-tests`, protocol/sender/receiver suites with strict unhandled rejections).
