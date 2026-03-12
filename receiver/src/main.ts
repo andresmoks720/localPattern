@@ -7,6 +7,8 @@ import {
   FRAME_TYPE_HEADER,
   MAGIC_BYTES,
   RECEIVER_ERROR_CODES,
+  RECEIVER_LOCK_CONFIRMATION,
+  RECEIVER_TIMEOUTS,
   parseFrame,
   type ReceiverSnapshot
 } from '@qr-data-bridge/protocol';
@@ -15,14 +17,13 @@ import { ReceiverIngestService } from './ingestService';
 const SCAN_INTERVAL_MS = 300;
 const SIGNAL_LOST_MS = 5000;
 const ARMING_WINDOW_MS = 2000;
-const HEADER_CONFIRMATION_WINDOW_MS = 1500;
-const HEADER_CONFIRMATION_REQUIRED = 3;
 const MIN_QR_AREA_RATIO = 0.015;
 const MAX_AREA_DRIFT_RATIO = 0.4;
 const MAX_ASPECT_DRIFT_RATIO = 0.25;
 const MAX_CENTER_DRIFT_RATIO = 0.12;
 const STABLE_SCANS_REQUIRED = 2;
 const THEME_KEY = 'qdb_theme';
+const DEBUG_EVENT_LOG_CAP = 100;
 
 const logger = {
   debug: (...args: unknown[]) => {
@@ -97,7 +98,14 @@ app.innerHTML = `
     <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
     <div id="progress-text">Waiting for header</div>
     <div id="scan-stats">Received 0 scans → 0 unique packets</div>
+    <div id="diagnostic-hint">Diagnostics: waiting for scan data.</div>
+    <div id="progress-health">Progress health: waiting for first frame…</div>
     <div id="last-received-time">Last packet: -</div>
+    <label class="inline-check"><input id="debug-log-enabled" type="checkbox"/> Debug event log</label>
+    <details id="debug-log-panel" class="debug-log" hidden>
+      <summary>Receiver event timeline</summary>
+      <pre id="debug-log-output">No events yet.</pre>
+    </details>
     <div id="warning" class="warning"></div>
     <button id="download-btn" type="button" disabled>Download File</button>
     <div class="hint">Tap Start Scan (required on iOS). Keep QR fully visible, hold both devices steady, move closer if scans fail, use fullscreen, and remember larger files are slower.</div>
@@ -112,6 +120,8 @@ const video = getElement<HTMLVideoElement>('#camera-preview');
 const progressBar = getElement<HTMLDivElement>('#progress-bar');
 const progressText = getElement<HTMLDivElement>('#progress-text');
 const scanStatsEl = getElement<HTMLDivElement>('#scan-stats');
+const diagnosticHintEl = getElement<HTMLDivElement>('#diagnostic-hint');
+const progressHealthEl = getElement<HTMLDivElement>('#progress-health');
 const warningEl = getElement<HTMLDivElement>('#warning');
 const panel = getElement<HTMLDivElement>('#receiver-panel');
 const lastPacketEl = getElement<HTMLDivElement>('#last-packet');
@@ -120,6 +130,9 @@ const lastReceivedTimeEl = getElement<HTMLDivElement>('#last-received-time');
 const themeButton = getElement<HTMLButtonElement>('#theme-btn');
 const soundEnabledInput = getElement<HTMLInputElement>('#sound-enabled');
 const cameraSelect = getElement<HTMLSelectElement>('#camera-select');
+const debugLogEnabledInput = getElement<HTMLInputElement>('#debug-log-enabled');
+const debugLogPanel = getElement<HTMLDetailsElement>('#debug-log-panel');
+const debugLogOutput = getElement<HTMLPreElement>('#debug-log-output');
 
 const frameCanvas = document.createElement('canvas');
 const frameContextCandidate = frameCanvas.getContext('2d', { willReadFrequently: true });
@@ -138,11 +151,26 @@ let successSoundPlayed = false;
 let ingestDecodeError: string | null = null;
 let selectedCameraId = '';
 let armingWindowEndsAt = 0;
-let lockConfirmed = false;
-let headerConfirmationTimes: number[] = [];
-let pendingHeaderSignature = '';
 let stableGeometryCount = 0;
 let lastGeometry: { areaRatio: number; aspectRatio: number; centerX: number; centerY: number } | null = null;
+let debugLogEnabled = false;
+const debugEventLines: string[] = [];
+
+function shortTransferId(transferId: string | null): string {
+  if (!transferId) return 'unknown';
+  return transferId.length <= 8 ? transferId : `${transferId.slice(0, 8)}…`;
+}
+
+function appendDebugEvent(message: string): void {
+  const timestamp = new Date().toLocaleTimeString();
+  debugEventLines.push(`[${timestamp}] ${message}`);
+  if (debugEventLines.length > DEBUG_EVENT_LOG_CAP) {
+    debugEventLines.splice(0, debugEventLines.length - DEBUG_EVENT_LOG_CAP);
+  }
+  if (debugLogEnabled) {
+    debugLogOutput.textContent = debugEventLines.join('\n');
+  }
+}
 
 const receiverMachine = new ReceiverMachine();
 const receiverIngest = new ReceiverIngestService({
@@ -151,6 +179,38 @@ const receiverIngest = new ReceiverIngestService({
     if (event.type === 'decodeError') {
       ingestDecodeError = event.message;
       logger.error('[receiver] packet validation failed', event.message);
+      appendDebugEvent(`Decode error: ${event.message}`);
+      return;
+    }
+
+    if (event.type === 'frameAccepted') {
+      if (event.frame.frameType === FRAME_TYPE_HEADER) {
+        appendDebugEvent(`Frame accepted: HEADER ${shortTransferId(event.snapshot.transferId)}`);
+      } else if (event.frame.frameType === FRAME_TYPE_DATA) {
+        appendDebugEvent(`Frame accepted: DATA packet ${event.frame.packetIndex}`);
+      } else if (event.frame.frameType === FRAME_TYPE_END) {
+        appendDebugEvent('Frame accepted: END');
+      }
+      return;
+    }
+
+    if (event.type === 'duplicateScannerPayload') {
+      appendDebugEvent('Duplicate scanner payload dropped');
+      return;
+    }
+
+    if (event.type === 'foreignFrameIgnored') {
+      appendDebugEvent('Foreign transfer frame ignored');
+      return;
+    }
+
+    if (event.type === 'badPacketCrcIgnored') {
+      appendDebugEvent('Packet CRC mismatch ignored');
+      return;
+    }
+
+    if (event.type === 'completed') {
+      appendDebugEvent(`Transfer completed in ${event.durationMs}ms`);
     }
   }
 });
@@ -208,15 +268,22 @@ function updateProgress(snapshot: ReceiverSnapshot): void {
 
   const diagnostics = receiverIngest.getDiagnostics();
   scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets • dup:${diagnostics.duplicateScannerPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads}`;
+
+  if (diagnostics.foreignTransferFrames > 0) {
+    diagnosticHintEl.textContent = 'Hint: multiple senders/QR streams detected. Keep only one sender QR visible.';
+  } else if (diagnostics.badPacketCrcFrames > 0) {
+    diagnosticHintEl.textContent = 'Hint: unstable captures (motion blur or glare) are causing packet CRC failures.';
+  } else if (diagnostics.nonProtocolPayloads > 0 || diagnostics.malformedPayloads > 0) {
+    diagnosticHintEl.textContent = 'Hint: camera decode noise or wrong QR in view. Improve lighting/framing.';
+  } else if (diagnostics.duplicateScannerPayloads > 0 && diagnostics.acceptedFrames <= 2) {
+    diagnosticHintEl.textContent = 'Hint: scanner is re-reading the same frame. Re-align and hold both devices steady.';
+  } else {
+    diagnosticHintEl.textContent = 'Diagnostics: signal looks healthy.';
+  }
 }
 
 function isProtocolPayload(rawPayload: Uint8Array): boolean {
   return rawPayload.length > 5 && MAGIC_BYTES.every((byte, index) => rawPayload[index] === byte);
-}
-
-function headerSignature(frame: ReturnType<typeof parseFrame>): string {
-  if (frame.frameType !== FRAME_TYPE_HEADER) return '';
-  return `${frame.transferId.join(',')}|${frame.fileName}|${frame.fileSize}|${frame.totalPackets}|${frame.fileCrc32}`;
 }
 
 function polygonArea(points: Array<{ x: number; y: number }>): number {
@@ -296,16 +363,25 @@ function applyDownload(snapshot: ReceiverSnapshot): void {
 
 function applySnapshot(snapshot: ReceiverSnapshot): void {
   updateProgress(snapshot);
+  const transferDetails = snapshot.fileName && snapshot.totalPackets !== null && snapshot.expectedFileSize !== null
+    ? `${snapshot.fileName} • ${snapshot.expectedFileSize} bytes • ${snapshot.totalPackets} packets`
+    : '';
 
   if (snapshot.state === 'IDLE') {
     setStage('IDLE', 'Ready to scan');
     lockStatusEl.textContent = 'Searching for start frame...';
+    lastPacketEl.textContent = '';
     return;
   }
 
   if (snapshot.state === 'SCANNING') {
-    setStage('SCANNING', lockConfirmed ? 'Start frame confirmed' : 'Searching for start frame...');
-    lockStatusEl.textContent = lockConfirmed ? 'Start frame confirmed.' : 'Searching for start frame...';
+    setStage('SCANNING', 'Searching for start frame...');
+    lockStatusEl.textContent = snapshot.transferId
+      ? `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`
+      : snapshot.headerConfirmations > 0
+        ? `Searching for start frame (${snapshot.headerConfirmations}/${RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS} confirmations)`
+        : 'Searching for start frame...';
+    lastPacketEl.textContent = transferDetails;
     if (!warningEl.textContent.startsWith('Signal Lost')) {
       warningEl.textContent = '';
     }
@@ -314,22 +390,21 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
 
   if (snapshot.state === 'RECEIVING') {
     setStage('RECEIVING', 'Receiving packets');
-    lockStatusEl.textContent = 'Start frame confirmed.';
-    if (snapshot.fileName && snapshot.totalPackets !== null && snapshot.expectedFileSize !== null) {
-      lastPacketEl.textContent = `${snapshot.fileName} • ${snapshot.expectedFileSize} bytes • ${snapshot.totalPackets} packets`;
-    }
+    lockStatusEl.textContent = `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`;
+    lastPacketEl.textContent = transferDetails;
     return;
   }
 
   if (snapshot.state === 'VERIFYING') {
     setStage('VERIFYING', 'Verifying');
-    lockStatusEl.textContent = 'Start frame confirmed.';
+    lockStatusEl.textContent = `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`;
+    lastPacketEl.textContent = transferDetails;
     return;
   }
 
   if (snapshot.state === 'SUCCESS') {
     setStage('SUCCESS', 'File ready');
-    lockStatusEl.textContent = 'Start frame confirmed.';
+    lockStatusEl.textContent = `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`;
     warningEl.textContent = '';
     applyDownload(snapshot);
     if (!successSoundPlayed) {
@@ -343,15 +418,24 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
   }
 
   const code = snapshot.error?.code;
-  lockStatusEl.textContent = lockConfirmed ? 'Start frame confirmed.' : 'Searching for start frame...';
-  setStage('ERROR', code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH ? 'Decode error' : 'Transfer incomplete, restart sender');
-  if (code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
-    warningEl.textContent = 'Corruption error: file CRC32 mismatch detected. Retry with slower frame rate.';
-  } else if (code === RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT || code === RECEIVER_ERROR_CODES.END_INCOMPLETE) {
-    warningEl.textContent = 'Transfer incomplete, restart sender.';
+  lockStatusEl.textContent = snapshot.transferId
+    ? `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`
+    : 'Searching for start frame...';
+  setStage('ERROR', 'Transfer error');
+  if (code === RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT) {
+    warningEl.textContent = 'No progress timeout: reduce sender chunk size, increase QR size, hold devices steady, and restart sender.';
+  } else if (code === RECEIVER_ERROR_CODES.END_INCOMPLETE) {
+    warningEl.textContent = 'Transfer ended early: receiver saw END before all packets. Restart sender with higher redundancy.';
+  } else if (code === RECEIVER_ERROR_CODES.HEADER_CONFLICT) {
+    warningEl.textContent = 'Header conflict: another transfer stream was detected. Keep only one sender QR visible and retry.';
+  } else if (code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
+    warningEl.textContent = 'Corruption detected (CRC mismatch), often caused by motion blur or glare. Retry with steadier framing/slower settings.';
+  } else if (code === RECEIVER_ERROR_CODES.FILE_SIZE_MISMATCH || code === RECEIVER_ERROR_CODES.MISSING_PACKET) {
+    warningEl.textContent = 'Packet loss detected (missing/size mismatch). Retry with slower pace and higher redundancy settings.';
   } else {
-    warningEl.textContent = snapshot.error?.message ?? 'Transfer incomplete, restart sender.';
+    warningEl.textContent = snapshot.error?.message ?? 'Transfer failed. Restart sender and retry.';
   }
+  appendDebugEvent(`Transfer failed: ${code ?? 'UNKNOWN'}${snapshot.error?.message ? ` (${snapshot.error.message})` : ''}`);
   stopScanLoop(true);
   scanButton.textContent = 'Restart Scan';
 }
@@ -368,12 +452,14 @@ function resetUiForNewScan(): void {
   lastPacketAt = 0;
   lastReceivedTimeEl.textContent = 'Last packet: -';
   armingWindowEndsAt = Date.now() + ARMING_WINDOW_MS;
-  lockConfirmed = false;
-  headerConfirmationTimes = [];
-  pendingHeaderSignature = '';
   stableGeometryCount = 0;
   lastGeometry = null;
   lockStatusEl.textContent = 'Searching for start frame...';
+  progressHealthEl.textContent = 'Progress health: waiting for first frame…';
+  diagnosticHintEl.textContent = 'Diagnostics: waiting for scan data.';
+  debugEventLines.length = 0;
+  debugLogOutput.textContent = 'No events yet.';
+  appendDebugEvent('Scan started');
   applySnapshot(receiverMachine.snapshot);
 }
 
@@ -412,34 +498,6 @@ function processFrame(now: number): void {
     }
 
     const inArmingWindow = nowMs < armingWindowEndsAt;
-
-    if (!lockConfirmed) {
-      if (parsedFrame.frameType !== FRAME_TYPE_HEADER) {
-        rafId = requestAnimationFrame(processFrame);
-        return;
-      }
-
-      const signature = headerSignature(parsedFrame);
-      if (signature !== pendingHeaderSignature) {
-        pendingHeaderSignature = signature;
-        headerConfirmationTimes = [nowMs];
-        rafId = requestAnimationFrame(processFrame);
-        return;
-      }
-
-      headerConfirmationTimes = headerConfirmationTimes
-        .filter((observedAt) => nowMs - observedAt <= HEADER_CONFIRMATION_WINDOW_MS);
-      headerConfirmationTimes.push(nowMs);
-
-      if (headerConfirmationTimes.length < HEADER_CONFIRMATION_REQUIRED) {
-        rafId = requestAnimationFrame(processFrame);
-        return;
-      }
-
-      lockConfirmed = true;
-      lockStatusEl.textContent = 'Start frame confirmed.';
-    }
-
     if (inArmingWindow && (parsedFrame.frameType === FRAME_TYPE_DATA || parsedFrame.frameType === FRAME_TYPE_END)) {
       rafId = requestAnimationFrame(processFrame);
       return;
@@ -460,15 +518,35 @@ function processFrame(now: number): void {
 }
 
 function updateSignalHealth(): void {
-  const snapshot = receiverMachine.tick(Date.now());
+  const now = Date.now();
+  const snapshot = receiverMachine.tick(now);
   applySnapshot(snapshot);
 
-  if (snapshot.state !== 'SCANNING' && snapshot.state !== 'RECEIVING') return;
+  const sinceLastUniqueSeconds = (() => {
+    const reference = snapshot.lastUniquePacketAt ?? scanStartedAt;
+    if (!reference) return null;
+    return Math.max(0, Math.floor((now - reference) / 1000));
+  })();
 
-  const now = Date.now();
-  const reference = lastPacketAt > 0 ? lastPacketAt : scanStartedAt;
+  let timeoutText = 'Progress timeout inactive';
+  if (snapshot.transferId && snapshot.lastUniquePacketAt) {
+    const remainingMs = Math.max(0, RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS - (now - snapshot.lastUniquePacketAt));
+    const remainingSeconds = Math.ceil(remainingMs / 1000);
+    timeoutText = `${remainingSeconds}s until no-progress timeout`;
+    if (remainingSeconds <= 5 && sinceLastUniqueSeconds !== null) {
+      warningEl.textContent = `No new packets for ${sinceLastUniqueSeconds}s, timeout in ${remainingSeconds}s.`;
+    }
+  }
+
+  progressHealthEl.textContent = sinceLastUniqueSeconds === null
+    ? `Progress health: waiting for first frame • ${timeoutText}`
+    : `Progress health: ${sinceLastUniqueSeconds}s since last unique packet • ${timeoutText}`;
+
+  if (!snapshot.lockConfirmed) return;
+
+  const reference = snapshot.lastUniquePacketAt ?? scanStartedAt;
   if (reference > 0 && now - reference > SIGNAL_LOST_MS) {
-    warningEl.textContent = 'Signal Lost - Check Alignment';
+    warningEl.textContent = 'Signal Lost - Active transfer stalled. Check alignment and keep sender visible.';
   }
 }
 
@@ -558,6 +636,14 @@ scanButton.addEventListener('click', async () => {
 soundEnabledInput.addEventListener('change', () => {
   soundEnabled = soundEnabledInput.checked;
   void resumeAudioContext();
+});
+
+debugLogEnabledInput.addEventListener('change', () => {
+  debugLogEnabled = debugLogEnabledInput.checked;
+  debugLogPanel.hidden = !debugLogEnabled;
+  if (debugLogEnabled) {
+    debugLogOutput.textContent = debugEventLines.length > 0 ? debugEventLines.join('\n') : 'No events yet.';
+  }
 });
 
 cameraSelect.addEventListener('change', () => {

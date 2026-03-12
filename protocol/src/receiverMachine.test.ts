@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { FRAME_TYPE_DATA, FRAME_TYPE_HEADER, PROTOCOL_ERROR_CODES, ProtocolError, assembleFrame, chunkFile, parseFrame, type TransferDataFrame, type TransferHeaderFrame } from './index';
-import { RECEIVER_ERROR_CODES, RECEIVER_STATE_TRANSITIONS, RECEIVER_TIMEOUTS, ReceiverMachine } from './receiverMachine';
+import { RECEIVER_ERROR_CODES, RECEIVER_LOCK_CONFIRMATION, RECEIVER_STATE_TRANSITIONS, RECEIVER_TIMEOUTS, ReceiverMachine } from './receiverMachine';
+
+
+function confirmHeaderLock(machine: ReceiverMachine, header: TransferHeaderFrame, startNow = 1): void {
+  for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+    machine.applyFrame(header, startNow + i);
+  }
+}
 
 describe('receiver machine', () => {
   it('locks to first transferId and ignores other transfer data', () => {
@@ -10,7 +17,7 @@ describe('receiver machine', () => {
     const transferA = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
     const transferB = chunkFile(new Uint8Array([9, 9]), { fileName: 'b.bin', maxPayloadSize: 2, includeEndFrame: true });
 
-    machine.applyFrame(transferA.header, 1);
+    confirmHeaderLock(machine, transferA.header, 1);
     machine.applyFrame(transferB.header, 2);
     machine.applyFrame(transferB.dataFrames[0], 3);
 
@@ -31,12 +38,23 @@ describe('receiver machine', () => {
     expect(snapshot.receivedCount).toBe(0);
   });
 
+  it('does not lock on a single accidental HEADER', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const transfer = chunkFile(new Uint8Array([1, 2]), { fileName: 'single.bin', maxPayloadSize: 2, includeEndFrame: true });
+
+    const snapshot = machine.applyFrame(transfer.header, 1);
+    expect(snapshot.state).toBe('SCANNING');
+    expect(snapshot.lockConfirmed).toBe(false);
+    expect(snapshot.transferId).toBeNull();
+  });
+
   it('errors on conflicting same-transfer HEADER metadata', () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
 
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
 
     const conflictingHeader: TransferHeaderFrame = {
       ...transfer.header,
@@ -52,7 +70,7 @@ describe('receiver machine', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'dup.bin', maxPayloadSize: 2, includeEndFrame: true });
     machine.startScanning();
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
     machine.applyFrame(transfer.dataFrames[0], 2);
     const snapshot = machine.applyFrame(transfer.dataFrames[0], 3);
 
@@ -63,7 +81,7 @@ describe('receiver machine', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'ok.bin', maxPayloadSize: 2, includeEndFrame: true });
     machine.startScanning();
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
     machine.applyFrame(transfer.dataFrames[0], 2);
     const snapshot = machine.applyFrame(transfer.dataFrames[1], 3);
 
@@ -76,7 +94,7 @@ describe('receiver machine', () => {
     const transferA = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
     const transferB = chunkFile(new Uint8Array([9]), { fileName: 'b.bin', maxPayloadSize: 1, includeEndFrame: true });
     machine.startScanning();
-    machine.applyFrame(transferA.header, 1);
+    confirmHeaderLock(machine, transferA.header, 1);
     machine.applyFrame(transferA.dataFrames[0], 2);
     const snapshot = machine.applyFrame(transferB.endFrame!, 3);
 
@@ -88,9 +106,9 @@ describe('receiver machine', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'zero-time.bin', maxPayloadSize: 2, includeEndFrame: true });
     machine.startScanning();
-    machine.applyFrame(transfer.header, 0);
+    confirmHeaderLock(machine, transfer.header, 0);
 
-    const snapshot = machine.tick(RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + 1);
+    const snapshot = machine.tick(RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS);
     expect(snapshot.state).toBe('ERROR');
     expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT);
   });
@@ -99,7 +117,7 @@ describe('receiver machine', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'x.bin', maxPayloadSize: 2, includeEndFrame: true });
     machine.startScanning();
-    machine.applyFrame(transfer.header, 100);
+    confirmHeaderLock(machine, transfer.header, 100);
     machine.applyFrame(transfer.dataFrames[0], 150);
     machine.applyFrame(transfer.endFrame!, 200);
 
@@ -114,7 +132,7 @@ describe('receiver machine', () => {
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'no-end.bin', maxPayloadSize: 3, includeEndFrame: true });
     machine.startScanning();
 
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
     const snapshot = machine.applyFrame(transfer.dataFrames[0], 2);
 
     expect(snapshot.state).toBe('SUCCESS');
@@ -126,8 +144,7 @@ describe('receiver machine', () => {
     const transfer = chunkFile(new Uint8Array(), { fileName: 'empty.bin', maxPayloadSize: 4, includeEndFrame: true });
     machine.startScanning();
 
-    const afterHeader = machine.applyFrame(transfer.header, 1);
-    expect(afterHeader.state).toBe('RECEIVING');
+    confirmHeaderLock(machine, transfer.header, 1);
 
     const afterEnd = machine.applyFrame(transfer.endFrame!, 2);
     expect(afterEnd.state).toBe('SUCCESS');
@@ -160,7 +177,7 @@ describe('receiver machine', () => {
     };
 
     machine.startScanning();
-    machine.applyFrame(badHeader, 1);
+    confirmHeaderLock(machine, badHeader, 1);
     const snapshot = machine.applyFrame(transfer.dataFrames[0], 2);
 
     expect(snapshot.state).toBe('ERROR');
@@ -171,7 +188,7 @@ describe('receiver machine', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'bounds.bin', maxPayloadSize: 3, includeEndFrame: true });
     machine.startScanning();
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
 
     const outOfRange: TransferDataFrame = {
       ...transfer.dataFrames[0],
@@ -190,7 +207,7 @@ describe('receiver machine', () => {
     machine.startScanning();
 
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
 
     const conflictingHeader: TransferHeaderFrame = {
       ...transfer.header,
@@ -207,7 +224,7 @@ describe('receiver machine', () => {
     machine.startScanning();
 
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
 
     const conflictingHeader: TransferHeaderFrame = {
       ...transfer.header,
@@ -224,7 +241,7 @@ describe('receiver machine', () => {
     machine.startScanning();
 
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
 
     const conflictingHeader: TransferHeaderFrame = {
       ...transfer.header,
@@ -243,8 +260,11 @@ describe('receiver machine', () => {
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'same.bin', maxPayloadSize: 2, includeEndFrame: true });
     const first = machine.applyFrame(transfer.header, 1);
     const second = machine.applyFrame(transfer.header, 2);
+    const third = machine.applyFrame(transfer.header, 3);
 
-    expect(second.state).toBe('RECEIVING');
+    expect(first.state).toBe('SCANNING');
+    expect(second.state).toBe('SCANNING');
+    expect(third.state).toBe('RECEIVING');
     expect(second.transferId).toBe(first.transferId);
     expect(second.totalScans).toBe(first.totalScans + 1);
     expect(second.receivedCount).toBe(0);
@@ -255,7 +275,7 @@ describe('receiver machine', () => {
     machine.startScanning();
 
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'same.bin', maxPayloadSize: 2, includeEndFrame: true });
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
     machine.applyFrame(transfer.endFrame!, 2);
     const second = machine.applyFrame(transfer.endFrame!, 3);
 
@@ -282,14 +302,14 @@ describe('receiver machine', () => {
       {
         name: 'HEADER_CONFLICT',
         trigger: (machine) => {
-          machine.applyFrame(baseTransfer.header, 1);
+          confirmHeaderLock(machine, baseTransfer.header, 1);
           machine.applyFrame({ ...baseTransfer.header, totalPackets: baseTransfer.header.totalPackets + 1 }, 2);
         }
       },
       {
         name: 'FILE_CRC_MISMATCH',
         trigger: (machine) => {
-          machine.applyFrame({ ...baseTransfer.header, fileCrc32: (baseTransfer.header.fileCrc32 + 1) >>> 0 }, 1);
+          confirmHeaderLock(machine, { ...baseTransfer.header, fileCrc32: (baseTransfer.header.fileCrc32 + 1) >>> 0 }, 1);
           machine.applyFrame(baseTransfer.dataFrames[0], 2);
           machine.applyFrame(baseTransfer.dataFrames[1], 3);
         }
@@ -297,7 +317,7 @@ describe('receiver machine', () => {
       {
         name: 'FILE_SIZE_MISMATCH',
         trigger: (machine) => {
-          machine.applyFrame({ ...baseTransfer.header, fileSize: baseTransfer.header.fileSize + 2 }, 1);
+          confirmHeaderLock(machine, { ...baseTransfer.header, fileSize: baseTransfer.header.fileSize + 2 }, 1);
           machine.applyFrame(baseTransfer.dataFrames[0], 2);
           machine.applyFrame(baseTransfer.dataFrames[1], 3);
         }
@@ -305,7 +325,7 @@ describe('receiver machine', () => {
       {
         name: 'END_INCOMPLETE',
         trigger: (machine) => {
-          machine.applyFrame(baseTransfer.header, 1);
+          confirmHeaderLock(machine, baseTransfer.header, 1);
           machine.applyFrame(baseTransfer.dataFrames[0], 2);
           machine.applyFrame(baseTransfer.endFrame!, 3);
           machine.tick(3 + RECEIVER_TIMEOUTS.END_GRACE_MS + 1);
@@ -314,7 +334,7 @@ describe('receiver machine', () => {
       {
         name: 'NO_PROGRESS_TIMEOUT',
         trigger: (machine) => {
-          machine.applyFrame(baseTransfer.header, 1);
+          confirmHeaderLock(machine, baseTransfer.header, 1);
           machine.applyFrame(baseTransfer.dataFrames[0], 2);
           machine.tick(2 + RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + 1);
         }
@@ -340,7 +360,7 @@ describe('receiver machine', () => {
     machine.startScanning();
 
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
     const conflictingHeader: TransferHeaderFrame = { ...transfer.header, fileName: 'conflict.bin' };
     const errored = machine.applyFrame(conflictingHeader, 2);
     expect(errored.state).toBe('ERROR');
@@ -358,7 +378,7 @@ describe('receiver machine', () => {
     const transferA = chunkFile(bytes, { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
     const transferB = chunkFile(bytes, { fileName: 'different-name.bin', transferId: transferA.header.transferId, maxPayloadSize: 2, includeEndFrame: true });
 
-    machine.applyFrame(transferB.header, 1);
+    confirmHeaderLock(machine, transferB.header, 1);
     machine.applyFrame(transferA.dataFrames[0], 2);
     const snapshot = machine.applyFrame(transferA.dataFrames[1], 3);
 
@@ -378,7 +398,7 @@ describe('receiver machine', () => {
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'fresh.bin', maxPayloadSize: 2, includeEndFrame: true });
 
     machine.startScanning();
-    machine.applyFrame(transfer.header, 1);
+    confirmHeaderLock(machine, transfer.header, 1);
     machine.applyFrame(transfer.dataFrames[0], 2);
     const success = machine.applyFrame(transfer.dataFrames[1], 3);
     expect(success.state).toBe('SUCCESS');
@@ -389,7 +409,7 @@ describe('receiver machine', () => {
     expect(machine.snapshot.receivedCount).toBe(0);
 
     machine.startScanning();
-    machine.applyFrame(transfer.header, 10);
+    confirmHeaderLock(machine, transfer.header, 10);
     machine.applyFrame({ ...transfer.header, fileName: 'conflict.bin' }, 11);
     expect(machine.snapshot.state).toBe('ERROR');
 

@@ -1,4 +1,4 @@
-import { MAGIC_BYTES, PROTOCOL_ERROR_CODES, ProtocolError, parseFrame, type ReceiverMachine, type ReceiverSnapshot, type TransferFrame } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_HEADER, MAGIC_BYTES, PROTOCOL_ERROR_CODES, ProtocolError, parseFrame, type ReceiverMachine, type ReceiverSnapshot, type TransferFrame } from '@qr-data-bridge/protocol';
 
 const DEFAULT_SCANNER_DEDUPE_WINDOW_MS = 4000;
 const DEFAULT_MAX_PENDING_INGESTIONS = 64;
@@ -135,21 +135,30 @@ export class ReceiverIngestService {
     }
 
     this.pruneDedupeWindow(now);
+    let duplicateScannerPayload = false;
     if (this.deps.scannerDedupeEnabled ?? true) {
       const dedupeKey = scannerPayloadKey(rawPayload);
       const seenAt = this.recentPayloads.get(dedupeKey);
       if (seenAt !== undefined && now - seenAt <= (this.deps.scannerDedupeWindowMs ?? DEFAULT_SCANNER_DEDUPE_WINDOW_MS)) {
-        this.diagnosticsValue.duplicateScannerPayloads += 1;
-        this.deps.onEvent?.({ type: 'duplicateScannerPayload' });
-        return null;
+        duplicateScannerPayload = true;
+      } else {
+        this.recentPayloads.set(dedupeKey, now);
+        this.recentPayloadOrder.push({ key: dedupeKey, seenAt: now });
       }
-      this.recentPayloads.set(dedupeKey, now);
-      this.recentPayloadOrder.push({ key: dedupeKey, seenAt: now });
     }
 
     try {
       const frame = parseFrame(rawPayload);
       const before = this.deps.machine.snapshot;
+
+      if (duplicateScannerPayload) {
+        const allowForHeaderLock = frame.frameType === FRAME_TYPE_HEADER && !before.lockConfirmed;
+        if (!allowForHeaderLock) {
+          this.diagnosticsValue.duplicateScannerPayloads += 1;
+          this.deps.onEvent?.({ type: 'duplicateScannerPayload' });
+          return null;
+        }
+      }
       const snapshot = this.deps.machine.applyFrame(frame, now);
 
       if (before.transferId && transferIdToHex(frame.transferId) !== before.transferId) {
