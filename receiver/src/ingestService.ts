@@ -8,6 +8,7 @@ export interface ReceiverIngestDiagnostics {
   nonProtocolPayloads: number;
   duplicateScannerPayloads: number;
   malformedPayloads: number;
+  protocolErrorFrames: number;
   badPacketCrcFrames: number;
   foreignTransferFrames: number;
   acceptedFrames: number;
@@ -70,6 +71,7 @@ export class ReceiverIngestService {
     nonProtocolPayloads: 0,
     duplicateScannerPayloads: 0,
     malformedPayloads: 0,
+    protocolErrorFrames: 0,
     badPacketCrcFrames: 0,
     foreignTransferFrames: 0,
     acceptedFrames: 0,
@@ -108,6 +110,7 @@ export class ReceiverIngestService {
       nonProtocolPayloads: 0,
       duplicateScannerPayloads: 0,
       malformedPayloads: 0,
+      protocolErrorFrames: 0,
       badPacketCrcFrames: 0,
       foreignTransferFrames: 0,
       acceptedFrames: 0,
@@ -184,15 +187,12 @@ export class ReceiverIngestService {
     }
 
     this.pruneDedupeWindow(now);
+    const dedupeKey = scannerPayloadKey(rawPayload);
     let duplicateScannerPayload = false;
     if (this.deps.scannerDedupeEnabled ?? true) {
-      const dedupeKey = scannerPayloadKey(rawPayload);
       const seenAt = this.recentPayloads.get(dedupeKey);
       if (seenAt !== undefined && now - seenAt <= (this.deps.scannerDedupeWindowMs ?? DEFAULT_SCANNER_DEDUPE_WINDOW_MS)) {
         duplicateScannerPayload = true;
-      } else {
-        this.recentPayloads.set(dedupeKey, now);
-        this.recentPayloadOrder.push({ key: dedupeKey, seenAt: now });
       }
     }
 
@@ -200,6 +200,11 @@ export class ReceiverIngestService {
       const frame = parseFrame(rawPayload);
       const before = this.deps.machine.snapshot;
       const tuple = frameTuple(frame);
+
+      if ((this.deps.scannerDedupeEnabled ?? true) && !duplicateScannerPayload) {
+        this.recentPayloads.set(dedupeKey, now);
+        this.recentPayloadOrder.push({ key: dedupeKey, seenAt: now });
+      }
 
       if (duplicateScannerPayload) {
         const allowForHeaderLock = frame.frameType === FRAME_TYPE_HEADER && !before.lockConfirmed;
@@ -250,9 +255,13 @@ export class ReceiverIngestService {
       return snapshot;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown packet decode error.';
-      if (error instanceof ProtocolError && error.code === PROTOCOL_ERROR_CODES.PACKET_CRC_MISMATCH) {
-        this.diagnosticsValue.badPacketCrcFrames += 1;
-        this.deps.onEvent?.({ type: 'badPacketCrcIgnored' });
+      if (error instanceof ProtocolError) {
+        if (error.code === PROTOCOL_ERROR_CODES.PACKET_CRC_MISMATCH) {
+          this.diagnosticsValue.badPacketCrcFrames += 1;
+          this.deps.onEvent?.({ type: 'badPacketCrcIgnored' });
+        } else {
+          this.diagnosticsValue.protocolErrorFrames += 1;
+        }
       } else {
         this.diagnosticsValue.malformedPayloads += 1;
       }
