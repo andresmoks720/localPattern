@@ -5,6 +5,10 @@ import {
   MAX_FILE_SIZE_BYTES,
   buildTransmissionFrames,
   encodeFrameToCanvas,
+  estimateTransmissionDurationMs,
+  FIXED_DATA_FRAME_DURATION_MS,
+  getFrameDisplayDurationMs,
+  preflightEncodeFrames,
   readFileBytes,
   toUserFacingSenderError,
   validateFileBeforeTransmission
@@ -43,12 +47,12 @@ interface SenderSettings {
 }
 
 const DEFAULT_SETTINGS: SenderSettings = {
-  frameDurationMs: 2000,
+  frameDurationMs: FIXED_DATA_FRAME_DURATION_MS,
   qrErrorCorrection: 'H',
   qrSizePx: 400,
   chunkSizeBytes: 512,
   chunkAuto: true,
-  redundancyCount: 3,
+  redundancyCount: 1,
   soundEnabled: false
 };
 
@@ -82,12 +86,12 @@ function readSettings(): SenderSettings {
   try {
     const parsed = JSON.parse(raw) as Partial<SenderSettings>;
     return {
-      frameDurationMs: clamp(parsed.frameDurationMs ?? DEFAULT_SETTINGS.frameDurationMs, 500, 5000),
+      frameDurationMs: FIXED_DATA_FRAME_DURATION_MS,
       qrErrorCorrection: parsed.qrErrorCorrection ?? DEFAULT_SETTINGS.qrErrorCorrection,
       qrSizePx: clamp(parsed.qrSizePx ?? DEFAULT_SETTINGS.qrSizePx, 200, 600),
       chunkSizeBytes: clamp(parsed.chunkSizeBytes ?? DEFAULT_SETTINGS.chunkSizeBytes, 128, 1024),
       chunkAuto: parsed.chunkAuto ?? true,
-      redundancyCount: clamp(parsed.redundancyCount ?? DEFAULT_SETTINGS.redundancyCount, 1, 5),
+      redundancyCount: 1,
       soundEnabled: parsed.soundEnabled ?? false
     };
   } catch {
@@ -246,7 +250,7 @@ function refreshEstimates(): void {
   const speed = estimatedSpeedBytesPerSec();
   speedMeta.textContent = `Estimated Speed: ${speed} B/s`;
   if (fileBytes) {
-    const estimatedMs = Math.ceil(streamFrames.length * settings.frameDurationMs);
+    const estimatedMs = estimateTransmissionDurationMs(streamFrames);
     etaMeta.textContent = `Estimated Time: ${formatDuration(estimatedMs)}`;
     const warnings: string[] = [];
     if (estimatedMs > 10 * 60 * 1000) warnings.push('Large files may take a very long time and may fail more often.');
@@ -259,8 +263,10 @@ function refreshEstimates(): void {
 }
 
 function updateSettingsUi(): void {
-  frameDurationInput.value = String(settings.frameDurationMs);
-  frameDurationLabel.textContent = `${settings.frameDurationMs}ms`;
+  settings.frameDurationMs = FIXED_DATA_FRAME_DURATION_MS;
+  frameDurationInput.value = String(FIXED_DATA_FRAME_DURATION_MS);
+  frameDurationInput.disabled = true;
+  frameDurationLabel.textContent = `${FIXED_DATA_FRAME_DURATION_MS}ms (fixed MVPv2)`;
   errorCorrectionSelect.value = settings.qrErrorCorrection;
   qrSizeInput.value = String(settings.qrSizePx);
   qrSizeLabel.textContent = `${settings.qrSizePx}px`;
@@ -268,8 +274,10 @@ function updateSettingsUi(): void {
   chunkSizeInput.value = String(settings.chunkSizeBytes);
   chunkSizeInput.disabled = settings.chunkAuto;
   chunkSizeLabel.textContent = settings.chunkAuto ? `${effectiveChunkSize()} bytes (auto)` : `${settings.chunkSizeBytes} bytes`;
-  redundancyInput.value = String(settings.redundancyCount);
-  redundancyLabel.textContent = `${settings.redundancyCount}x`;
+  settings.redundancyCount = 1;
+  redundancyInput.value = '1';
+  redundancyInput.disabled = true;
+  redundancyLabel.textContent = '1x (fixed MVPv2)';
   soundEnabledInput.checked = settings.soundEnabled;
   qrShell.style.setProperty('--qr-size', `${settings.qrSizePx}px`);
 }
@@ -376,7 +384,7 @@ function scheduleNextFrame(): void {
       const message = error instanceof Error ? error.message : 'Unknown QR encoding error.';
       stopTransmission(`Error: QR encode failed: ${message}`, 'ERROR');
     }
-  }, settings.frameDurationMs);
+  }, getFrameDisplayDurationMs(streamFrames[currentStreamIndex]));
 }
 
 function startCountdownAndTransmit(): void {
@@ -407,7 +415,7 @@ function startCountdownAndTransmit(): void {
 }
 
 frameDurationInput.addEventListener('input', () => {
-  settings.frameDurationMs = clamp(Number(frameDurationInput.value), 500, 5000);
+  settings.frameDurationMs = FIXED_DATA_FRAME_DURATION_MS;
   persistAndRefresh();
 });
 errorCorrectionSelect.addEventListener('change', () => {
@@ -427,7 +435,8 @@ chunkSizeInput.addEventListener('input', () => {
   persistAndRefresh();
 });
 redundancyInput.addEventListener('input', () => {
-  settings.redundancyCount = clamp(Number(redundancyInput.value), 1, 5);
+  settings.redundancyCount = 1;
+  redundancyInput.value = '1';
   persistAndRefresh();
 });
 soundEnabledInput.addEventListener('change', () => {
@@ -505,6 +514,23 @@ fileInput.addEventListener('change', async () => {
     return;
   }
 
+  try {
+    await preflightEncodeFrames(streamFrames, {
+      qrPrefix: QR_PREFIX,
+      qrErrorCorrection: settings.qrErrorCorrection,
+      qrSizePx: settings.qrSizePx
+    });
+  } catch (error) {
+    transmissionFrames = [];
+    streamFrames = [];
+    totalDataPackets = 0;
+    const message = error instanceof Error ? error.message : 'Error: frame precompute failed.';
+    setSenderStage('ERROR', message);
+    warningMeta.textContent = 'Adjust settings and retry transmission.';
+    startButton.disabled = true;
+    return;
+  }
+
   currentStreamIndex = 0;
   setSenderStage('READY', 'Ready to transmit');
   startButton.disabled = false;
@@ -542,7 +568,7 @@ setSenderStage('NO_FILE', 'No file selected');
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden' && isTransmitting) {
-    stopTransmission('Error: tab hidden. Restart transmission.', 'ERROR');
+    stopTransmission('Transmission interrupted. Restart required.', 'ERROR');
   }
 });
 
