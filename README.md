@@ -47,17 +47,23 @@ Defaults are tuned for reliability: **2000ms frame duration**, **H ECC**, **400p
 - **Camera unavailable:** verify browser permission settings, then refresh.
 - **Android says camera in use:** stop scan in app to release camera stream, then retry.
 
-## Deployment
-### Option A (simplest): two repositories/sites
-Deploy `sender` and `receiver` as separate GitHub Pages projects.
+## GitHub Pages deployment
+This repository deploys through **GitHub Actions** using the official Pages artifact flow in `.github/workflows/deploy-pages.yml`.
 
-### Option B (single site, recommended)
-This repo includes a GitHub Actions workflow that:
-1. Builds sender + receiver (`npm run build:pages`)
-2. Publishes `.pages-dist` to GitHub Pages
-3. Hosts at `/sender/` and `/receiver/`
+Manual one-time repo setting (cannot be set in code):
+- **Settings → Pages → Source: `GitHub Actions`**
+- **Do not use** `Deploy from a branch` for this repo.
 
-Workflow file: `.github/workflows/deploy-pages.yml`.
+The workflow builds and uploads `.pages-dist`, which should publish:
+- `/localPattern/`
+- `/localPattern/sender/`
+- `/localPattern/receiver/`
+
+Local verification:
+```bash
+npm ci
+npm run build:pages
+```
 
 ## PWA / Offline Notes
 - Both apps use `vite-plugin-pwa` and generate service workers at build time.
