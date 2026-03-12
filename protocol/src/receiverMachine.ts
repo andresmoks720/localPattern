@@ -3,7 +3,7 @@ import { PROTOCOL_ERROR_CODES, ProtocolError } from './types';
 import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferDataFrame, type TransferEndFrame, type TransferFrame, type TransferHeaderFrame } from './types';
 
 export const RECEIVER_TIMEOUTS = {
-  END_GRACE_MS: 2000,
+  END_GRACE_MS: 6000,
   NO_UNIQUE_PROGRESS_TIMEOUT_MS: 15000,
   LOCKED_TRANSFER_ACTIVITY_GRACE_MS: 2000
 } as const;
@@ -242,8 +242,12 @@ export class ReceiverMachine {
       && this.snapshotValue.totalPackets !== null
       && this.receivedPacketCount < this.snapshotValue.totalPackets
       && now - this.snapshotValue.endSeenAt > RECEIVER_TIMEOUTS.END_GRACE_MS
+      && (
+        this.snapshotValue.lastLockedTransferFrameAt === null
+        || now - this.snapshotValue.lastLockedTransferFrameAt > RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
+      )
     ) {
-      return this.fail(RECEIVER_ERROR_CODES.END_INCOMPLETE, 'END frame seen before all packets were received.');
+      return this.fail(RECEIVER_ERROR_CODES.END_INCOMPLETE, 'END frame seen before all packets were received and transfer activity stopped.');
     }
 
     return this.snapshot;

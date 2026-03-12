@@ -20,7 +20,7 @@ describe('layout stability smoke checks', () => {
 
   it('receiver scan geometry remains square and overlay is fixed inset', () => {
     const css = readFileSync(resolve(__dirname, '../../receiver/src/style.css'), 'utf8');
-    expect(css).toContain('.video-wrap { width: min(88vmin, calc(100vw - 350px)); height: min(88vmin, calc(100vw - 350px));');
+    expect(css).toContain('.video-wrap { width: min(88vmin, calc(100vw - 2rem)); height: min(88vmin, calc(100vw - 2rem));');
     expect(css).toContain('.scan-overlay { position: absolute; inset: 12%;');
   });
 });

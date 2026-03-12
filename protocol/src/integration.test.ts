@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FRAME_TYPE_HEADER, RECEIVER_ERROR_CODES, RECEIVER_LOCK_CONFIRMATION, ReceiverMachine, assembleFrame, chunkFile, parseFrame, type ReceiverSnapshot, type TransferFrame } from './index';
+import { FRAME_TYPE_HEADER, RECEIVER_ERROR_CODES, RECEIVER_LOCK_CONFIRMATION, RECEIVER_TIMEOUTS, ReceiverMachine, assembleFrame, chunkFile, parseFrame, type ReceiverSnapshot, type TransferFrame } from './index';
 
 
 function confirmHeaderLock(machine: ReceiverMachine, frame: TransferFrame, startNow: number): void {
@@ -118,7 +118,7 @@ describe('protocol integration', () => {
     machine.applyFrame(parseFrame(assembleFrame(nonEmptyTransfer.dataFrames[0])), 10_050);
     machine.applyFrame(parseFrame(assembleFrame(nonEmptyTransfer.endFrame!)), 10_100);
 
-    snapshot = machine.tick(12_200);
+    snapshot = machine.tick(10_100 + RECEIVER_TIMEOUTS.END_GRACE_MS + 10);
     expect(snapshot.state).toBe('ERROR');
     expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.END_INCOMPLETE);
   });
