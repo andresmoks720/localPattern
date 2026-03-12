@@ -145,6 +145,7 @@ let activeStream: MediaStream | null = null;
 let lastScanAt = 0;
 let scanStartedAt = 0;
 let lastDiscoveryActivityAt = 0;
+let lastProtocolFrameSeenAt = 0;
 let previousDiscoveryScanCount = 0;
 let downloadUrl: string | null = null;
 let soundEnabled = false;
@@ -494,6 +495,7 @@ function resetUiForNewScan(): void {
   successSoundPlayed = false;
   lastPacketEl.textContent = '';
   lastDiscoveryActivityAt = Date.now();
+  lastProtocolFrameSeenAt = 0;
   previousDiscoveryScanCount = 0;
   lastReceivedTimeEl.textContent = 'Last packet: -';
   armingWindowEndsAt = Date.now() + ARMING_WINDOW_MS;
@@ -542,6 +544,8 @@ function processFrame(now: number): void {
       return;
     }
 
+    lastProtocolFrameSeenAt = nowMs;
+
     const inArmingWindow = nowMs < armingWindowEndsAt;
     if (inArmingWindow && (parsedFrame.frameType === FRAME_TYPE_DATA || parsedFrame.frameType === FRAME_TYPE_END)) {
       rafId = requestAnimationFrame(processFrame);
@@ -574,7 +578,7 @@ function updateSignalHealth(): void {
       lastDiscoveryActivityAt = now;
     }
 
-    const discoveryReference = lastDiscoveryActivityAt || scanStartedAt;
+    const discoveryReference = Math.max(lastDiscoveryActivityAt, lastProtocolFrameSeenAt, scanStartedAt);
     const discoveryAgeSeconds = discoveryReference > 0 ? Math.max(0, Math.floor((now - discoveryReference) / 1000)) : null;
 
     progressHealthEl.textContent = discoveryAgeSeconds === null

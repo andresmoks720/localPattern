@@ -144,15 +144,21 @@ app.innerHTML = `
     </div>
   </section>
   <aside class="panel">
-    <div class="row">
-      <button id="theme-btn" type="button">Theme</button>
-      <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Sound</label>
+    <div class="controls-grid">
+      <div class="row">
+        <button id="theme-btn" type="button">Theme</button>
+        <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Sound</label>
+      </div>
+      <input id="file-input" type="file" />
+      <div class="action-row">
+        <button id="start-btn" type="button" disabled>Start Transmission</button>
+        <button id="stop-btn" type="button" disabled>Stop</button>
+      </div>
+      <div class="action-row">
+        <button id="clear-btn" type="button" data-persistent-control="true">Clear QR</button>
+        <button id="reset-btn" type="button">Reset</button>
+      </div>
     </div>
-    <input id="file-input" type="file" />
-    <button id="start-btn" type="button" disabled>Start Transmission</button>
-    <button id="stop-btn" type="button" disabled>Stop</button>
-    <button id="clear-btn" type="button" data-persistent-control="true">Clear QR</button>
-    <button id="reset-btn" type="button">Reset</button>
     <details>
       <summary>Settings</summary>
       <label>Frame Duration: <span id="frame-duration-label"></span>
