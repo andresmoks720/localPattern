@@ -54,8 +54,24 @@ export interface ReceiverSnapshot {
   lockConfirmed: boolean;
   headerConfirmations: number;
   candidateTransferId: string | null;
+  lastContiguousPacketIndex: number;
+  missingRanges: Array<{ start: number; end: number }>;
   fileBytes?: Uint8Array;
   error?: ReceiverMachineError;
+}
+
+export type ReceiverGapEventType = 'gap_detected' | 'gap_filled' | 'gap_lost';
+
+export interface ReceiverGapEvent {
+  type: ReceiverGapEventType;
+  streamId: string;
+  expectedSeq: number;
+  receivedSeq: number;
+  gapSize: number;
+  rangeStart: number;
+  rangeEnd: number;
+  retransmitRequested: boolean;
+  permanentlyLost: boolean;
 }
 
 function transferIdToKey(transferId: Uint8Array): string {
@@ -87,6 +103,8 @@ function toHeaderSignature(frame: TransferHeaderFrame): string {
 }
 
 export class ReceiverMachine {
+  private readonly onGapEvent?: (event: ReceiverGapEvent) => void;
+
   private snapshotValue: ReceiverSnapshot = {
     state: 'IDLE',
     transferId: null,
@@ -101,7 +119,9 @@ export class ReceiverMachine {
     endSeenAt: null,
     lockConfirmed: false,
     headerConfirmations: 0,
-    candidateTransferId: null
+    candidateTransferId: null,
+    lastContiguousPacketIndex: -1,
+    missingRanges: []
   };
 
   private packetPayloads: Array<Uint8Array | null> = [];
@@ -113,6 +133,14 @@ export class ReceiverMachine {
   private pendingHeaderSignature: string | null = null;
 
   private pendingHeaderFirstSeenAt: number | null = null;
+
+  private maxObservedPacketIndex = -1;
+
+  private activeGapKeys = new Set<string>();
+
+  constructor(options?: { onGapEvent?: (event: ReceiverGapEvent) => void }) {
+    this.onGapEvent = options?.onGapEvent;
+  }
 
   public startScanning(): void {
     this.reset();
@@ -134,17 +162,24 @@ export class ReceiverMachine {
       endSeenAt: null,
       lockConfirmed: false,
       headerConfirmations: 0,
-      candidateTransferId: null
+      candidateTransferId: null,
+      lastContiguousPacketIndex: -1,
+      missingRanges: []
     };
     this.packetPayloads = [];
     this.packetSeen = new Uint8Array(0);
     this.receivedPacketCount = 0;
     this.pendingHeaderSignature = null;
     this.pendingHeaderFirstSeenAt = null;
+    this.maxObservedPacketIndex = -1;
+    this.activeGapKeys.clear();
   }
 
   public get snapshot(): ReceiverSnapshot {
-    return { ...this.snapshotValue };
+    return {
+      ...this.snapshotValue,
+      missingRanges: this.snapshotValue.missingRanges.map((range) => ({ ...range }))
+    };
   }
 
   public applyFrame(frame: TransferFrame, now: number): ReceiverSnapshot {
@@ -258,7 +293,11 @@ export class ReceiverMachine {
     this.packetSeen = new Uint8Array(Math.ceil(frame.totalPackets / 8));
     clearBitset(this.packetSeen);
     this.receivedPacketCount = 0;
+    this.maxObservedPacketIndex = -1;
+    this.activeGapKeys.clear();
     this.snapshotValue.receivedCount = 0;
+    this.snapshotValue.lastContiguousPacketIndex = -1;
+    this.snapshotValue.missingRanges = [];
     this.snapshotValue.lockConfirmed = true;
     this.setState('RECEIVING');
   }
@@ -274,9 +313,11 @@ export class ReceiverMachine {
 
     this.packetPayloads[frame.packetIndex] = frame.payload;
     setBit(this.packetSeen, frame.packetIndex);
+    this.maxObservedPacketIndex = Math.max(this.maxObservedPacketIndex, frame.packetIndex);
     this.receivedPacketCount += 1;
     this.snapshotValue.receivedCount = this.receivedPacketCount;
     this.snapshotValue.lastUniquePacketAt = now;
+    this.reconcileGapState(frame.packetIndex);
   }
 
   private applyEnd(frame: TransferEndFrame, now: number): void {
@@ -353,8 +394,81 @@ export class ReceiverMachine {
   }
 
   private fail(code: ReceiverErrorCode, message: string): ReceiverSnapshot {
+    if (
+      this.snapshotValue.lockConfirmed
+      && this.snapshotValue.transferId
+      && (code === RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT || code === RECEIVER_ERROR_CODES.END_INCOMPLETE)
+    ) {
+      for (const range of this.snapshotValue.missingRanges) {
+        this.emitGapEvent('gap_lost', range.start, range.end, this.maxObservedPacketIndex);
+      }
+      this.activeGapKeys.clear();
+    }
     this.setState('ERROR');
     this.snapshotValue.error = { code, message };
     return this.snapshot;
+  }
+
+  private reconcileGapState(receivedSeq: number): void {
+    if (!this.snapshotValue.lockConfirmed || this.snapshotValue.totalPackets === null) return;
+
+    let contiguous = -1;
+    const scanLimit = this.maxObservedPacketIndex;
+    for (let i = 0; i <= scanLimit; i += 1) {
+      if (!hasBit(this.packetSeen, i)) break;
+      contiguous = i;
+    }
+    this.snapshotValue.lastContiguousPacketIndex = contiguous;
+
+    const currentRanges: Array<{ start: number; end: number }> = [];
+    let cursor = contiguous + 1;
+    while (cursor <= scanLimit) {
+      if (hasBit(this.packetSeen, cursor)) {
+        cursor += 1;
+        continue;
+      }
+      const start = cursor;
+      while (cursor <= scanLimit && !hasBit(this.packetSeen, cursor)) {
+        cursor += 1;
+      }
+      const end = cursor - 1;
+      currentRanges.push({ start, end });
+    }
+    this.snapshotValue.missingRanges = currentRanges;
+
+    const currentKeys = new Set(currentRanges.map((range) => `${range.start}-${range.end}`));
+    const resolvedKeys: string[] = [];
+    for (const gapKey of this.activeGapKeys) {
+      if (!currentKeys.has(gapKey)) {
+        const [startStr, endStr] = gapKey.split('-');
+        this.emitGapEvent('gap_filled', Number(startStr), Number(endStr), receivedSeq);
+        resolvedKeys.push(gapKey);
+      }
+    }
+    for (const gapKey of resolvedKeys) {
+      this.activeGapKeys.delete(gapKey);
+    }
+
+    for (const range of currentRanges) {
+      const key = `${range.start}-${range.end}`;
+      if (this.activeGapKeys.has(key)) continue;
+      this.activeGapKeys.add(key);
+      this.emitGapEvent('gap_detected', range.start, range.end, receivedSeq);
+    }
+  }
+
+  private emitGapEvent(type: ReceiverGapEventType, rangeStart: number, rangeEnd: number, receivedSeq: number): void {
+    if (!this.snapshotValue.transferId) return;
+    this.onGapEvent?.({
+      type,
+      streamId: this.snapshotValue.transferId,
+      expectedSeq: rangeStart,
+      receivedSeq,
+      gapSize: (rangeEnd - rangeStart) + 1,
+      rangeStart,
+      rangeEnd,
+      retransmitRequested: false,
+      permanentlyLost: type === 'gap_lost'
+    });
   }
 }
