@@ -1,13 +1,27 @@
 import { describe, expect, it } from 'vitest';
-import { RECEIVER_ERROR_CODES, ReceiverMachine, assembleFrame, chunkFile, parseFrame, type ReceiverSnapshot, type TransferFrame } from './index';
+import { FRAME_TYPE_HEADER, RECEIVER_ERROR_CODES, RECEIVER_LOCK_CONFIRMATION, ReceiverMachine, assembleFrame, chunkFile, parseFrame, type ReceiverSnapshot, type TransferFrame } from './index';
+
+
+function confirmHeaderLock(machine: ReceiverMachine, frame: TransferFrame, startNow: number): void {
+  if (frame.frameType !== FRAME_TYPE_HEADER) throw new Error('Expected HEADER frame');
+  for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+    machine.applyFrame(frame, startNow + i);
+  }
+}
 
 function runFrames(machine: ReceiverMachine, frames: Uint8Array[], startNow = 1_000): ReceiverSnapshot {
   let now = startNow;
   machine.startScanning();
   let snapshot = machine.snapshot;
 
-  for (const frameBytes of frames) {
-    const parsedFrame = parseFrame(frameBytes);
+  for (let index = 0; index < frames.length; index += 1) {
+    const parsedFrame = parseFrame(frames[index]);
+    if (index === 0 && parsedFrame.frameType === FRAME_TYPE_HEADER) {
+      confirmHeaderLock(machine, parsedFrame, now);
+      now += 50 * RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS;
+      snapshot = machine.snapshot;
+      continue;
+    }
     snapshot = machine.applyFrame(parsedFrame, now);
     now += 50;
   }
@@ -50,7 +64,8 @@ describe('protocol integration', () => {
     machine.startScanning();
 
     const header = parseFrame(assembleFrame(transfer.header));
-    let snapshot = machine.applyFrame(header, 1_000);
+    confirmHeaderLock(machine, header, 1_000);
+    let snapshot = machine.snapshot;
     expect(snapshot.state).toBe('RECEIVING');
 
     const firstDataWire = assembleFrame(transfer.dataFrames[0]);
@@ -80,7 +95,8 @@ describe('protocol integration', () => {
     machine.startScanning();
 
     const header = parseFrame(assembleFrame(emptyTransfer.header));
-    let snapshot = machine.applyFrame(header, 2_000);
+    confirmHeaderLock(machine, header, 2_000);
+    let snapshot = machine.snapshot;
     expect(snapshot.state).toBe('RECEIVING');
 
     snapshot = machine.tick(4_500);
@@ -98,7 +114,7 @@ describe('protocol integration', () => {
     });
 
     machine.startScanning();
-    machine.applyFrame(parseFrame(assembleFrame(nonEmptyTransfer.header)), 10_000);
+    confirmHeaderLock(machine, parseFrame(assembleFrame(nonEmptyTransfer.header)), 10_000);
     machine.applyFrame(parseFrame(assembleFrame(nonEmptyTransfer.dataFrames[0])), 10_050);
     machine.applyFrame(parseFrame(assembleFrame(nonEmptyTransfer.endFrame!)), 10_100);
 
@@ -122,7 +138,7 @@ describe('protocol integration', () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
 
-    machine.applyFrame(parseFrame(assembleFrame(transferA.header)), 5_000);
+    confirmHeaderLock(machine, parseFrame(assembleFrame(transferA.header)), 5_000);
     let snapshot = machine.applyFrame(parseFrame(assembleFrame(transferB.header)), 5_050);
     expect(snapshot.transferId).toBe(Array.from(transferA.header.transferId).map((value) => value.toString(16).padStart(2, '0')).join(''));
 
@@ -155,7 +171,7 @@ describe('protocol integration', () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
 
-    machine.applyFrame(parseFrame(assembleFrame(firstTransfer.header)), 7_000);
+    confirmHeaderLock(machine, parseFrame(assembleFrame(firstTransfer.header)), 7_000);
     const snapshot = machine.applyFrame(parseFrame(assembleFrame(conflictingTransfer.header)), 7_050);
 
     expect(snapshot.state).toBe('ERROR');
@@ -172,7 +188,7 @@ describe('protocol integration', () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
 
-    machine.applyFrame(parseFrame(assembleFrame(transfer.header)), 20_000);
+    confirmHeaderLock(machine, parseFrame(assembleFrame(transfer.header)), 20_000);
     machine.applyFrame(parseFrame(assembleFrame(transfer.dataFrames[0])), 20_100);
 
     let snapshot = machine.applyFrame(parseFrame(assembleFrame(transfer.dataFrames[0])), 20_200);

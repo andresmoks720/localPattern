@@ -6,6 +6,11 @@ export const RECEIVER_TIMEOUTS = {
   NO_UNIQUE_PROGRESS_TIMEOUT_MS: 15000
 } as const;
 
+export const RECEIVER_LOCK_CONFIRMATION = {
+  REQUIRED_HEADERS: 3,
+  WINDOW_MS: 1500
+} as const;
+
 export type ReceiverState = 'IDLE' | 'SCANNING' | 'RECEIVING' | 'VERIFYING' | 'SUCCESS' | 'ERROR';
 
 export const RECEIVER_STATE_TRANSITIONS: Record<ReceiverState, ReceiverState[]> = {
@@ -44,6 +49,9 @@ export interface ReceiverSnapshot {
   totalScans: number;
   lastUniquePacketAt: number | null;
   endSeenAt: number | null;
+  lockConfirmed: boolean;
+  headerConfirmations: number;
+  candidateTransferId: string | null;
   fileBytes?: Uint8Array;
   error?: ReceiverMachineError;
 }
@@ -72,6 +80,10 @@ function setBit(bitset: Uint8Array, index: number): void {
   bitset[byteIndex] |= bitMask;
 }
 
+function toHeaderSignature(frame: TransferHeaderFrame): string {
+  return `${transferIdToKey(frame.transferId)}|${frame.fileName || 'received.bin'}|${frame.fileSize}|${frame.totalPackets}|${frame.fileCrc32}`;
+}
+
 export class ReceiverMachine {
   private snapshotValue: ReceiverSnapshot = {
     state: 'IDLE',
@@ -83,7 +95,10 @@ export class ReceiverMachine {
     receivedCount: 0,
     totalScans: 0,
     lastUniquePacketAt: null,
-    endSeenAt: null
+    endSeenAt: null,
+    lockConfirmed: false,
+    headerConfirmations: 0,
+    candidateTransferId: null
   };
 
   private packetPayloads: Array<Uint8Array | null> = [];
@@ -91,6 +106,10 @@ export class ReceiverMachine {
   private packetSeen = new Uint8Array(0);
 
   private receivedPacketCount = 0;
+
+  private pendingHeaderSignature: string | null = null;
+
+  private pendingHeaderFirstSeenAt: number | null = null;
 
   public startScanning(): void {
     this.reset();
@@ -108,11 +127,16 @@ export class ReceiverMachine {
       receivedCount: 0,
       totalScans: 0,
       lastUniquePacketAt: null,
-      endSeenAt: null
+      endSeenAt: null,
+      lockConfirmed: false,
+      headerConfirmations: 0,
+      candidateTransferId: null
     };
     this.packetPayloads = [];
     this.packetSeen = new Uint8Array(0);
     this.receivedPacketCount = 0;
+    this.pendingHeaderSignature = null;
+    this.pendingHeaderFirstSeenAt = null;
   }
 
   public get snapshot(): ReceiverSnapshot {
@@ -147,15 +171,15 @@ export class ReceiverMachine {
     }
 
     if (
-      this.snapshotValue.transferId
+      this.snapshotValue.lockConfirmed
       && this.snapshotValue.lastUniquePacketAt !== null
       && now - this.snapshotValue.lastUniquePacketAt > RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS
     ) {
-      return this.fail(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT, 'No new unique packets for 15 seconds.');
+      return this.fail(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT, 'No new unique packets for 15 seconds after transfer lock.');
     }
 
     if (
-      this.snapshotValue.transferId
+      this.snapshotValue.lockConfirmed
       && this.snapshotValue.endSeenAt !== null
       && this.snapshotValue.totalPackets !== null
       && this.receivedPacketCount < this.snapshotValue.totalPackets
@@ -169,21 +193,47 @@ export class ReceiverMachine {
 
   private applyHeader(frame: TransferHeaderFrame, now: number): void {
     const incomingTransferId = transferIdToKey(frame.transferId);
+
+    if (!this.snapshotValue.lockConfirmed) {
+      this.observeHeaderCandidate(frame, incomingTransferId, now);
+      return;
+    }
+
     if (this.snapshotValue.transferId && this.snapshotValue.transferId !== incomingTransferId) {
       return;
     }
 
-    if (this.snapshotValue.transferId === incomingTransferId) {
-      const hasConflict = (
-        this.snapshotValue.fileName !== (frame.fileName || 'received.bin')
-        || this.snapshotValue.expectedFileSize !== frame.fileSize
-        || this.snapshotValue.totalPackets !== frame.totalPackets
-        || this.snapshotValue.fileCrc32 !== frame.fileCrc32
-      );
+    const hasConflict = (
+      this.snapshotValue.fileName !== (frame.fileName || 'received.bin')
+      || this.snapshotValue.expectedFileSize !== frame.fileSize
+      || this.snapshotValue.totalPackets !== frame.totalPackets
+      || this.snapshotValue.fileCrc32 !== frame.fileCrc32
+    );
 
-      if (hasConflict) {
-        this.fail(RECEIVER_ERROR_CODES.HEADER_CONFLICT, 'Conflicting HEADER metadata for active transferId.');
-      }
+    if (hasConflict) {
+      this.fail(RECEIVER_ERROR_CODES.HEADER_CONFLICT, 'Conflicting HEADER metadata for active transferId.');
+    }
+  }
+
+  private observeHeaderCandidate(frame: TransferHeaderFrame, incomingTransferId: string, now: number): void {
+    const signature = toHeaderSignature(frame);
+
+    if (
+      this.pendingHeaderSignature !== signature
+      || this.pendingHeaderFirstSeenAt === null
+      || now - this.pendingHeaderFirstSeenAt > RECEIVER_LOCK_CONFIRMATION.WINDOW_MS
+    ) {
+      this.pendingHeaderSignature = signature;
+      this.pendingHeaderFirstSeenAt = now;
+      this.snapshotValue.headerConfirmations = 1;
+      this.snapshotValue.candidateTransferId = incomingTransferId;
+      return;
+    }
+
+    this.snapshotValue.headerConfirmations += 1;
+    this.snapshotValue.candidateTransferId = incomingTransferId;
+
+    if (this.snapshotValue.headerConfirmations < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS) {
       return;
     }
 
@@ -192,17 +242,18 @@ export class ReceiverMachine {
     this.snapshotValue.expectedFileSize = frame.fileSize;
     this.snapshotValue.totalPackets = frame.totalPackets;
     this.snapshotValue.fileCrc32 = frame.fileCrc32;
-    this.snapshotValue.lastUniquePacketAt = this.snapshotValue.lastUniquePacketAt ?? now;
+    this.snapshotValue.lastUniquePacketAt = now;
     this.packetPayloads = Array.from({ length: frame.totalPackets }, () => null);
     this.packetSeen = new Uint8Array(Math.ceil(frame.totalPackets / 8));
     clearBitset(this.packetSeen);
     this.receivedPacketCount = 0;
     this.snapshotValue.receivedCount = 0;
+    this.snapshotValue.lockConfirmed = true;
     this.setState('RECEIVING');
   }
 
   private applyData(frame: TransferDataFrame, now: number): void {
-    if (!this.snapshotValue.transferId || this.snapshotValue.totalPackets === null) return;
+    if (!this.snapshotValue.lockConfirmed || !this.snapshotValue.transferId || this.snapshotValue.totalPackets === null) return;
     if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
     if (frame.packetIndex < 0 || frame.packetIndex >= this.snapshotValue.totalPackets) return;
     if (hasBit(this.packetSeen, frame.packetIndex)) return;
@@ -215,13 +266,13 @@ export class ReceiverMachine {
   }
 
   private applyEnd(frame: TransferEndFrame, now: number): void {
-    if (!this.snapshotValue.transferId) return;
+    if (!this.snapshotValue.lockConfirmed || !this.snapshotValue.transferId) return;
     if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
     this.snapshotValue.endSeenAt = now;
   }
 
   private evaluateCompletion(): ReceiverSnapshot {
-    if (this.snapshotValue.totalPackets === null || this.snapshotValue.fileCrc32 === null) {
+    if (!this.snapshotValue.lockConfirmed || this.snapshotValue.totalPackets === null || this.snapshotValue.fileCrc32 === null) {
       return this.snapshot;
     }
 
