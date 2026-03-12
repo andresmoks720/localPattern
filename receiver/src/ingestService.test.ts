@@ -298,6 +298,53 @@ describe('ReceiverIngestService', () => {
     expect(diagnostics.duplicateScannerPayloads).toBeGreaterThan(0);
   });
 
+
+  it('treats locked-transfer duplicates as activity without counting unique progress', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({ machine });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), {
+      fileName: 'activity.bin',
+      maxPayloadSize: 2,
+      includeEndFrame: true
+    });
+
+    const headerPayload = assembleFrame(transfer.header);
+    const dataPayload = assembleFrame(transfer.dataFrames[0]);
+
+    ingestHeaderConfirmations(service, headerPayload, 1000);
+    service.ingest(dataPayload, 1010);
+    const uniqueAt = machine.snapshot.lastUniquePacketAt;
+
+    service.ingest(dataPayload, 1011);
+    const snapshot = machine.snapshot;
+
+    expect(snapshot.lastUniquePacketAt).toBe(uniqueAt);
+    expect(snapshot.lastLockedTransferFrameAt).toBe(1011);
+  });
+
+  it('uses parsed frame from scan pipeline when enqueuing', async () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({ machine });
+
+    const transfer = chunkFile(new Uint8Array([1, 2]), {
+      fileName: 'parsed.bin',
+      maxPayloadSize: 2,
+      includeEndFrame: true
+    });
+
+    const headerPayload = assembleFrame(transfer.header);
+    const parsedHeader = transfer.header;
+
+    for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+      await service.enqueue(headerPayload, 1000 + i, parsedHeader);
+    }
+
+    expect(machine.snapshot.lockConfirmed).toBe(true);
+  });
+
   it('bounds pending ingestion queue to prevent unbounded scan callback growth', async () => {
     const machine = new ReceiverMachine();
     machine.startScanning();

@@ -35,6 +35,7 @@ interface PendingIngestion {
   rawPayload: Uint8Array;
   now: number;
   dedupeKey: string;
+  parsedFrame: TransferFrame | null;
 }
 
 interface ScannerKeyEntry {
@@ -51,12 +52,11 @@ function transferIdToHex(transferId: Uint8Array): string {
 }
 
 function scannerPayloadKey(rawPayload: Uint8Array): string {
-  let hash = 2166136261;
+  let hex = '';
   for (let i = 0; i < rawPayload.length; i += 1) {
-    hash ^= rawPayload[i];
-    hash = Math.imul(hash, 16777619);
+    hex += rawPayload[i].toString(16).padStart(2, '0');
   }
-  return `${rawPayload.length}:${hash >>> 0}`;
+  return `${rawPayload.length}:${hex}`;
 }
 
 export class ReceiverIngestService {
@@ -123,15 +123,20 @@ export class ReceiverIngestService {
     return { ...this.diagnosticsValue };
   }
 
-  public enqueue(rawPayload: Uint8Array, now: number): Promise<ReceiverSnapshot | null> {
+  public enqueue(rawPayload: Uint8Array, now: number, parsedFrame: TransferFrame | null = null): Promise<ReceiverSnapshot | null> {
     const dedupeKey = scannerPayloadKey(rawPayload);
     const windowMs = this.deps.scannerDedupeWindowMs ?? DEFAULT_SCANNER_DEDUPE_WINDOW_MS;
     let allowForHeaderLockDuplicates = false;
-    try {
-      const frame = parseFrame(rawPayload);
-      allowForHeaderLockDuplicates = frame.frameType === FRAME_TYPE_HEADER && !this.deps.machine.snapshot.lockConfirmed;
-    } catch {
-      allowForHeaderLockDuplicates = false;
+    if (parsedFrame) {
+      allowForHeaderLockDuplicates = parsedFrame.frameType === FRAME_TYPE_HEADER && !this.deps.machine.snapshot.lockConfirmed;
+    } else {
+      try {
+        const frame = parseFrame(rawPayload);
+        parsedFrame = frame;
+        allowForHeaderLockDuplicates = frame.frameType === FRAME_TYPE_HEADER && !this.deps.machine.snapshot.lockConfirmed;
+      } catch {
+        allowForHeaderLockDuplicates = false;
+      }
     }
 
     if (this.deps.scannerDedupeEnabled ?? true) {
@@ -154,14 +159,15 @@ export class ReceiverIngestService {
 
     const maxPendingIngestions = this.deps.maxPendingIngestions ?? DEFAULT_MAX_PENDING_INGESTIONS;
     if (this.pendingIngestions.length >= maxPendingIngestions) {
-      const removed = this.pendingIngestions.shift();
+      const dropIndex = this.findQueueOverflowDropIndex(dedupeKey);
+      const [removed] = this.pendingIngestions.splice(dropIndex, 1);
       if (removed) {
         this.pendingKeyToIndex.delete(removed.dedupeKey);
       }
-      this.reindexPendingKeysFrom(0);
+      this.reindexPendingKeysFrom(dropIndex);
       this.diagnosticsValue.droppedQueuedPayloads += 1;
     }
-    this.pendingIngestions.push({ rawPayload, now, dedupeKey });
+    this.pendingIngestions.push({ rawPayload, now, dedupeKey, parsedFrame });
     this.pendingKeyToIndex.set(dedupeKey, this.pendingIngestions.length - 1);
 
     this.ingestionChain = this.ingestionChain.then(async () => {
@@ -169,7 +175,7 @@ export class ReceiverIngestService {
       if (!next) return null;
       this.pendingKeyToIndex.delete(next.dedupeKey);
       this.reindexPendingKeysFrom(0);
-      return this.ingestNow(next.rawPayload, next.now);
+      return this.ingestNow(next.rawPayload, next.now, next.parsedFrame);
     });
     return this.ingestionChain;
   }
@@ -178,7 +184,7 @@ export class ReceiverIngestService {
     return this.ingestNow(rawPayload, now);
   }
 
-  private ingestNow(rawPayload: Uint8Array, now: number): ReceiverSnapshot | null {
+  private ingestNow(rawPayload: Uint8Array, now: number, parsedFrame: TransferFrame | null = null): ReceiverSnapshot | null {
     this.diagnosticsValue.totalPayloadsSeen += 1;
 
     if (!this.isProtocolPayload(rawPayload)) {
@@ -197,7 +203,7 @@ export class ReceiverIngestService {
     }
 
     try {
-      const frame = parseFrame(rawPayload);
+      const frame = parsedFrame ?? parseFrame(rawPayload);
       const before = this.deps.machine.snapshot;
       const tuple = frameTuple(frame);
 
@@ -208,6 +214,7 @@ export class ReceiverIngestService {
 
       if (duplicateScannerPayload) {
         const allowForHeaderLock = frame.frameType === FRAME_TYPE_HEADER && !before.lockConfirmed;
+        this.deps.machine.noteLockedTransferActivity(frame, now);
         if (!allowForHeaderLock) {
           this.diagnosticsValue.duplicateScannerPayloads += 1;
           this.deps.onEvent?.({ type: 'duplicateScannerPayload' });
@@ -291,6 +298,25 @@ export class ReceiverIngestService {
     for (let i = startIndex; i < this.pendingIngestions.length; i += 1) {
       this.pendingKeyToIndex.set(this.pendingIngestions[i].dedupeKey, i);
     }
+  }
+
+  private findQueueOverflowDropIndex(incomingKey: string): number {
+    if (this.pendingIngestions.length === 0) return 0;
+
+    const keyCounts = new Map<string, number>();
+    for (const pending of this.pendingIngestions) {
+      keyCounts.set(pending.dedupeKey, (keyCounts.get(pending.dedupeKey) ?? 0) + 1);
+    }
+    keyCounts.set(incomingKey, (keyCounts.get(incomingKey) ?? 0) + 1);
+
+    for (let i = 0; i < this.pendingIngestions.length; i += 1) {
+      const key = this.pendingIngestions[i].dedupeKey;
+      if ((keyCounts.get(key) ?? 0) > 1) {
+        return i;
+      }
+    }
+
+    return 0;
   }
 }
 

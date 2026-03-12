@@ -183,6 +183,15 @@ export class ReceiverMachine {
     };
   }
 
+  public noteLockedTransferActivity(frame: TransferFrame, now: number): void {
+    if (!this.snapshotValue.lockConfirmed || !this.snapshotValue.transferId) return;
+
+    const transferId = transferIdToKey(frame.transferId);
+    if (transferId !== this.snapshotValue.transferId) return;
+
+    this.snapshotValue.lastLockedTransferFrameAt = now;
+  }
+
   public applyFrame(frame: TransferFrame, now: number): ReceiverSnapshot {
     if (this.snapshotValue.state === 'ERROR' || this.snapshotValue.state === 'SUCCESS') {
       return this.snapshot;
