@@ -548,7 +548,7 @@ function processFrame(now: number): void {
       return;
     }
 
-    void receiverIngest.enqueue(rawPayload, nowMs).then((snapshot) => {
+    void receiverIngest.enqueue(rawPayload, nowMs, parsedFrame).then((snapshot) => {
       if (snapshot) {
         applySnapshot(snapshot);
       } else if (ingestDecodeError) {
