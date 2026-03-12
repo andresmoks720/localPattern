@@ -1,4 +1,5 @@
 import { calculateCRC32 } from './crc32';
+import { PROTOCOL_ERROR_CODES, ProtocolError } from './types';
 import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferDataFrame, type TransferEndFrame, type TransferFrame, type TransferHeaderFrame } from './types';
 
 export const RECEIVER_TIMEOUTS = {
@@ -152,21 +153,26 @@ export class ReceiverMachine {
       return this.snapshot;
     }
 
-    this.snapshotValue.totalScans += 1;
-
     if (frame.frameType === FRAME_TYPE_HEADER) {
+      this.snapshotValue.totalScans += 1;
       this.applyHeader(frame, now);
       return this.evaluateCompletion();
     }
     if (frame.frameType === FRAME_TYPE_DATA) {
+      this.snapshotValue.totalScans += 1;
       this.applyData(frame, now);
       return this.evaluateCompletion();
     }
     if (frame.frameType === FRAME_TYPE_END) {
+      this.snapshotValue.totalScans += 1;
       this.applyEnd(frame, now);
       return this.evaluateCompletion();
     }
-    return this.snapshot;
+
+    throw new ProtocolError(
+      PROTOCOL_ERROR_CODES.UNSUPPORTED_FRAME_TYPE,
+      `Unsupported frame type in receiver dispatch: ${String((frame as { frameType?: unknown }).frameType)}`
+    );
   }
 
   public tick(now: number): ReceiverSnapshot {

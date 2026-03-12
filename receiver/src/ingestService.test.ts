@@ -26,6 +26,14 @@ function mutatePacketCrc(frame: TransferDataFrame): Uint8Array {
 }
 
 
+
+
+function unsupportedFramePayload(type = 0x7f): Uint8Array {
+  const bytes = new Uint8Array(4 + 1 + 8);
+  bytes.set([0x51, 0x44, 0x42, 0x32], 0);
+  bytes[4] = type;
+  return bytes;
+}
 function ingestHeaderConfirmations(service: ReceiverIngestService, headerPayload: Uint8Array, startAt: number): void {
   for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
     service.ingest(headerPayload, startAt + i);
@@ -104,6 +112,28 @@ describe('ReceiverIngestService', () => {
     const diagnostics = service.getDiagnostics();
     expect(diagnostics.nonProtocolPayloads).toBe(1);
     expect(diagnostics.malformedPayloads).toBe(0);
+  });
+
+  it('rejects unsupported frame types and increments protocol error diagnostics without dedupe caching', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({
+      machine
+    });
+
+    const unknownPayload = unsupportedFramePayload();
+    service.ingest(unknownPayload, 1000);
+    service.ingest(unknownPayload, 1001);
+
+    const snapshot = machine.snapshot;
+    const diagnostics = service.getDiagnostics();
+
+    expect(snapshot.lockConfirmed).toBe(false);
+    expect(snapshot.transferId).toBeNull();
+    expect(snapshot.receivedCount).toBe(0);
+    expect(diagnostics.protocolErrorFrames).toBe(2);
+    expect(diagnostics.duplicateScannerPayloads).toBe(0);
+    expect(diagnostics.acceptedFrames).toBe(0);
   });
 
   it('tracks bad DATA packet CRC as ignorable frame-loss bucket', () => {

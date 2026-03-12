@@ -27,6 +27,16 @@ describe('receiver machine', () => {
     expect(snapshot.fileName).toBe('a.bin');
   });
 
+  it('rejects unsupported frame types during dispatch', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+
+    expect(() => machine.applyFrame({ frameType: 0x7f } as unknown as TransferHeaderFrame, 1)).toThrow(ProtocolError);
+    expect(machine.snapshot.totalScans).toBe(0);
+    expect(machine.snapshot.lockConfirmed).toBe(false);
+    expect(machine.snapshot.receivedCount).toBe(0);
+  });
+
   it('ignores DATA before HEADER and keeps scanning state', () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
