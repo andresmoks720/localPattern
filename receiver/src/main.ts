@@ -144,7 +144,8 @@ let monitorInterval: number | null = null;
 let activeStream: MediaStream | null = null;
 let lastScanAt = 0;
 let scanStartedAt = 0;
-let lastPacketAt = 0;
+let lastDiscoveryActivityAt = 0;
+let previousDiscoveryScanCount = 0;
 let downloadUrl: string | null = null;
 let soundEnabled = false;
 let successSoundPlayed = false;
@@ -361,6 +362,30 @@ function applyDownload(snapshot: ReceiverSnapshot): void {
   };
 }
 
+
+function getLockedTransferActivityAt(snapshot: ReceiverSnapshot): number | null {
+  if (!snapshot.lockConfirmed) return null;
+  if (snapshot.lastLockedTransferFrameAt !== null) return snapshot.lastLockedTransferFrameAt;
+  return snapshot.lastUniquePacketAt;
+}
+
+function formatDiagnosticsContext(): string {
+  const diagnostics = receiverIngest.getDiagnostics();
+  if (diagnostics.foreignTransferFrames > 0) {
+    return `Detected ${diagnostics.foreignTransferFrames} foreign frames; keep one sender QR visible.`;
+  }
+  if (diagnostics.badPacketCrcFrames > 0) {
+    return `Detected ${diagnostics.badPacketCrcFrames} CRC failures; reduce blur/glare and hold devices steady.`;
+  }
+  if (diagnostics.malformedPayloads > 0 || diagnostics.nonProtocolPayloads > 0) {
+    return 'Camera is seeing non-protocol/invalid payloads; tighten framing and improve lighting.';
+  }
+  if (diagnostics.duplicateScannerPayloads > 0) {
+    return 'Mostly duplicate frames are being read; slow sender pace or increase frame dwell.';
+  }
+  return 'No ingest anomalies detected; likely true sender/visibility stall.';
+}
+
 function applySnapshot(snapshot: ReceiverSnapshot): void {
   updateProgress(snapshot);
   const transferDetails = snapshot.fileName && snapshot.totalPackets !== null && snapshot.expectedFileSize !== null
@@ -422,10 +447,11 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
     ? `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`
     : 'Searching for start frame...';
   setStage('ERROR', 'Transfer error');
+  const diagnosticsContext = formatDiagnosticsContext();
   if (code === RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT) {
-    warningEl.textContent = 'No progress timeout: reduce sender chunk size, increase QR size, hold devices steady, and restart sender.';
+    warningEl.textContent = `Locked transfer stalled with no unique progress before timeout. ${diagnosticsContext}`;
   } else if (code === RECEIVER_ERROR_CODES.END_INCOMPLETE) {
-    warningEl.textContent = 'Transfer ended early: receiver saw END before all packets. Restart sender with higher redundancy.';
+    warningEl.textContent = 'END arrived before all packets were received. Restart sender, increase redundancy, and keep sender visible until completion.';
   } else if (code === RECEIVER_ERROR_CODES.HEADER_CONFLICT) {
     warningEl.textContent = 'Header conflict: another transfer stream was detected. Keep only one sender QR visible and retry.';
   } else if (code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
@@ -449,7 +475,8 @@ function resetUiForNewScan(): void {
   ingestDecodeError = null;
   successSoundPlayed = false;
   lastPacketEl.textContent = '';
-  lastPacketAt = 0;
+  lastDiscoveryActivityAt = Date.now();
+  previousDiscoveryScanCount = 0;
   lastReceivedTimeEl.textContent = 'Last packet: -';
   armingWindowEndsAt = Date.now() + ARMING_WINDOW_MS;
   stableGeometryCount = 0;
@@ -506,8 +533,6 @@ function processFrame(now: number): void {
     void receiverIngest.enqueue(rawPayload, nowMs).then((snapshot) => {
       if (snapshot) {
         applySnapshot(snapshot);
-        lastPacketAt = Date.now();
-        lastReceivedTimeEl.textContent = `Last packet: ${new Date(lastPacketAt).toLocaleTimeString()}`;
       } else if (ingestDecodeError) {
         warningEl.textContent = `Decode error: ${ingestDecodeError}`;
       }
@@ -522,33 +547,63 @@ function updateSignalHealth(): void {
   const snapshot = receiverMachine.tick(now);
   applySnapshot(snapshot);
 
-  const sinceLastUniqueSeconds = (() => {
-    const reference = snapshot.lastUniquePacketAt ?? scanStartedAt;
-    if (!reference) return null;
-    return Math.max(0, Math.floor((now - reference) / 1000));
-  })();
+  const lockedActivityAt = getLockedTransferActivityAt(snapshot);
+  const diagnostics = receiverIngest.getDiagnostics();
+
+  if (!snapshot.lockConfirmed) {
+    if (snapshot.totalScans > previousDiscoveryScanCount) {
+      previousDiscoveryScanCount = snapshot.totalScans;
+      lastDiscoveryActivityAt = now;
+    }
+
+    const discoveryReference = lastDiscoveryActivityAt || scanStartedAt;
+    const discoveryAgeSeconds = discoveryReference > 0 ? Math.max(0, Math.floor((now - discoveryReference) / 1000)) : null;
+
+    progressHealthEl.textContent = discoveryAgeSeconds === null
+      ? 'Progress health: waiting for protocol frames to lock transfer…'
+      : `Progress health: pre-lock discovery active (${snapshot.headerConfirmations}/${RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS} header confirmations, ${discoveryAgeSeconds}s since last protocol frame)`;
+
+    if (discoveryReference > 0 && now - discoveryReference > SIGNAL_LOST_MS) {
+      warningEl.textContent = `Signal Lost - No lock yet and no decodable protocol frames for ${discoveryAgeSeconds ?? 0}s. Check framing/lighting and keep sender QR fully visible.`;
+    }
+
+    lastReceivedTimeEl.textContent = discoveryReference > 0
+      ? `Last packet: ${new Date(discoveryReference).toLocaleTimeString()}`
+      : 'Last packet: -';
+    return;
+  }
+
+  const uniqueReference = snapshot.lastUniquePacketAt ?? scanStartedAt;
+  const sinceLastUniqueSeconds = uniqueReference > 0 ? Math.max(0, Math.floor((now - uniqueReference) / 1000)) : null;
 
   let timeoutText = 'Progress timeout inactive';
-  if (snapshot.transferId && snapshot.lastUniquePacketAt) {
-    const remainingMs = Math.max(0, RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS - (now - snapshot.lastUniquePacketAt));
-    const remainingSeconds = Math.ceil(remainingMs / 1000);
-    timeoutText = `${remainingSeconds}s until no-progress timeout`;
-    if (remainingSeconds <= 5 && sinceLastUniqueSeconds !== null) {
-      warningEl.textContent = `No new packets for ${sinceLastUniqueSeconds}s, timeout in ${remainingSeconds}s.`;
+  if (snapshot.lastUniquePacketAt) {
+    const uniqueRemainingMs = Math.max(0, RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS - (now - snapshot.lastUniquePacketAt));
+    const activityRemainingMs = snapshot.lastLockedTransferFrameAt === null
+      ? 0
+      : Math.max(0, RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS - (now - snapshot.lastLockedTransferFrameAt));
+    const uniqueRemainingSeconds = Math.ceil(uniqueRemainingMs / 1000);
+    const activityRemainingSeconds = Math.ceil(activityRemainingMs / 1000);
+    timeoutText = `no-progress in ${uniqueRemainingSeconds}s (locked-activity grace ${activityRemainingSeconds}s)`;
+    if (uniqueRemainingSeconds <= 5 && sinceLastUniqueSeconds !== null) {
+      warningEl.textContent = `No new unique packets for ${sinceLastUniqueSeconds}s. Timeout requires activity silence too (${activityRemainingSeconds}s grace left).`;
     }
   }
 
   progressHealthEl.textContent = sinceLastUniqueSeconds === null
-    ? `Progress health: waiting for first frame • ${timeoutText}`
+    ? `Progress health: waiting for first unique packet • ${timeoutText}`
     : `Progress health: ${sinceLastUniqueSeconds}s since last unique packet • ${timeoutText}`;
 
-  if (!snapshot.lockConfirmed) return;
+  const postLockReference = lockedActivityAt ?? uniqueReference;
+  lastReceivedTimeEl.textContent = postLockReference && postLockReference > 0
+    ? `Last packet: ${new Date(postLockReference).toLocaleTimeString()}`
+    : 'Last packet: -';
 
-  const reference = snapshot.lastUniquePacketAt ?? scanStartedAt;
-  if (reference > 0 && now - reference > SIGNAL_LOST_MS) {
-    warningEl.textContent = 'Signal Lost - Active transfer stalled. Check alignment and keep sender visible.';
+  if (postLockReference > 0 && now - postLockReference > SIGNAL_LOST_MS) {
+    warningEl.textContent = `Signal Lost - Locked transfer has no frame activity for ${Math.floor((now - postLockReference) / 1000)}s. ${formatDiagnosticsContext()} (dup:${diagnostics.duplicateScannerPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads})`;
   }
 }
+
 
 
 async function populateCameraOptions(): Promise<void> {

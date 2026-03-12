@@ -3,7 +3,8 @@ import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferDataFr
 
 export const RECEIVER_TIMEOUTS = {
   END_GRACE_MS: 2000,
-  NO_UNIQUE_PROGRESS_TIMEOUT_MS: 15000
+  NO_UNIQUE_PROGRESS_TIMEOUT_MS: 15000,
+  LOCKED_TRANSFER_ACTIVITY_GRACE_MS: 2000
 } as const;
 
 export const RECEIVER_LOCK_CONFIRMATION = {
@@ -48,6 +49,7 @@ export interface ReceiverSnapshot {
   receivedCount: number;
   totalScans: number;
   lastUniquePacketAt: number | null;
+  lastLockedTransferFrameAt: number | null;
   endSeenAt: number | null;
   lockConfirmed: boolean;
   headerConfirmations: number;
@@ -95,6 +97,7 @@ export class ReceiverMachine {
     receivedCount: 0,
     totalScans: 0,
     lastUniquePacketAt: null,
+    lastLockedTransferFrameAt: null,
     endSeenAt: null,
     lockConfirmed: false,
     headerConfirmations: 0,
@@ -127,6 +130,7 @@ export class ReceiverMachine {
       receivedCount: 0,
       totalScans: 0,
       lastUniquePacketAt: null,
+      lastLockedTransferFrameAt: null,
       endSeenAt: null,
       lockConfirmed: false,
       headerConfirmations: 0,
@@ -174,6 +178,10 @@ export class ReceiverMachine {
       this.snapshotValue.lockConfirmed
       && this.snapshotValue.lastUniquePacketAt !== null
       && now - this.snapshotValue.lastUniquePacketAt > RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS
+      && (
+        this.snapshotValue.lastLockedTransferFrameAt === null
+        || now - this.snapshotValue.lastLockedTransferFrameAt > RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
+      )
     ) {
       return this.fail(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT, 'No new unique packets for 15 seconds after transfer lock.');
     }
@@ -202,6 +210,8 @@ export class ReceiverMachine {
     if (this.snapshotValue.transferId && this.snapshotValue.transferId !== incomingTransferId) {
       return;
     }
+
+    this.snapshotValue.lastLockedTransferFrameAt = now;
 
     const hasConflict = (
       this.snapshotValue.fileName !== (frame.fileName || 'received.bin')
@@ -243,6 +253,7 @@ export class ReceiverMachine {
     this.snapshotValue.totalPackets = frame.totalPackets;
     this.snapshotValue.fileCrc32 = frame.fileCrc32;
     this.snapshotValue.lastUniquePacketAt = now;
+    this.snapshotValue.lastLockedTransferFrameAt = now;
     this.packetPayloads = Array.from({ length: frame.totalPackets }, () => null);
     this.packetSeen = new Uint8Array(Math.ceil(frame.totalPackets / 8));
     clearBitset(this.packetSeen);
@@ -255,6 +266,9 @@ export class ReceiverMachine {
   private applyData(frame: TransferDataFrame, now: number): void {
     if (!this.snapshotValue.lockConfirmed || !this.snapshotValue.transferId || this.snapshotValue.totalPackets === null) return;
     if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
+
+    this.snapshotValue.lastLockedTransferFrameAt = now;
+
     if (frame.packetIndex < 0 || frame.packetIndex >= this.snapshotValue.totalPackets) return;
     if (hasBit(this.packetSeen, frame.packetIndex)) return;
 
@@ -268,6 +282,7 @@ export class ReceiverMachine {
   private applyEnd(frame: TransferEndFrame, now: number): void {
     if (!this.snapshotValue.lockConfirmed || !this.snapshotValue.transferId) return;
     if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
+    this.snapshotValue.lastLockedTransferFrameAt = now;
     this.snapshotValue.endSeenAt = now;
   }
 
