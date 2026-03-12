@@ -178,7 +178,7 @@ describe('protocol integration', () => {
     expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.HEADER_CONFLICT);
   });
 
-  it('times out on no unique progress when only duplicates are received', () => {
+  it('does not time out while locked-transfer duplicates keep arriving within activity grace window', () => {
     const transfer = chunkFile(new Uint8Array([10, 20, 30, 40]), {
       fileName: 'duplicates.bin',
       maxPayloadSize: 2,
@@ -191,10 +191,36 @@ describe('protocol integration', () => {
     confirmHeaderLock(machine, parseFrame(assembleFrame(transfer.header)), 20_000);
     machine.applyFrame(parseFrame(assembleFrame(transfer.dataFrames[0])), 20_100);
 
-    let snapshot = machine.applyFrame(parseFrame(assembleFrame(transfer.dataFrames[0])), 20_200);
-    expect(snapshot.receivedCount).toBe(1);
+    let now = 20_200;
+    let snapshot = machine.snapshot;
+    while (now <= 35_500) {
+      snapshot = machine.applyFrame(parseFrame(assembleFrame(transfer.dataFrames[0])), now);
+      now += 1_000;
+    }
 
-    snapshot = machine.tick(35_200);
+    snapshot = machine.tick(35_600);
+    expect(snapshot.state).toBe('RECEIVING');
+    expect(snapshot.error).toBeUndefined();
+
+    snapshot = machine.tick(37_700);
+    expect(snapshot.state).toBe('ERROR');
+    expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT);
+  });
+
+  it('times out on no unique progress when there is no locked-transfer activity', () => {
+    const transfer = chunkFile(new Uint8Array([10, 20, 30, 40]), {
+      fileName: 'stall.bin',
+      maxPayloadSize: 2,
+      includeEndFrame: true
+    });
+
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+
+    confirmHeaderLock(machine, parseFrame(assembleFrame(transfer.header)), 40_000);
+    machine.applyFrame(parseFrame(assembleFrame(transfer.dataFrames[0])), 40_100);
+
+    const snapshot = machine.tick(55_101);
     expect(snapshot.state).toBe('ERROR');
     expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT);
   });
