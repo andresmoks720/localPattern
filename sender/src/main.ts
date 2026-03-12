@@ -51,7 +51,7 @@ interface SenderSettings {
 const DEFAULT_SETTINGS: SenderSettings = {
   frameDurationMs: DEFAULT_DATA_FRAME_DURATION_MS,
   qrErrorCorrection: 'H',
-  qrSizePx: 400,
+  qrSizePx: 520,
   chunkSizeBytes: 512,
   chunkAuto: true,
   redundancyCount: 1,
@@ -90,7 +90,7 @@ function readSettings(): SenderSettings {
     return {
       frameDurationMs: clamp(parsed.frameDurationMs ?? DEFAULT_SETTINGS.frameDurationMs, 500, 5000),
       qrErrorCorrection: parsed.qrErrorCorrection ?? DEFAULT_SETTINGS.qrErrorCorrection,
-      qrSizePx: clamp(parsed.qrSizePx ?? DEFAULT_SETTINGS.qrSizePx, 200, 600),
+      qrSizePx: clamp(parsed.qrSizePx ?? DEFAULT_SETTINGS.qrSizePx, 200, 1000),
       chunkSizeBytes: clamp(parsed.chunkSizeBytes ?? DEFAULT_SETTINGS.chunkSizeBytes, 128, 1024),
       chunkAuto: parsed.chunkAuto ?? true,
       redundancyCount: 1,
@@ -151,6 +151,7 @@ app.innerHTML = `
     <input id="file-input" type="file" />
     <button id="start-btn" type="button" disabled>Start Transmission</button>
     <button id="stop-btn" type="button" disabled>Stop</button>
+    <button id="clear-btn" type="button">Clear QR</button>
     <button id="reset-btn" type="button">Reset</button>
     <details>
       <summary>Settings</summary>
@@ -161,7 +162,7 @@ app.innerHTML = `
         <select id="error-correction"><option value="L">L</option><option value="M">M</option><option value="Q">Q</option><option value="H">H</option></select>
       </label>
       <label>QR Size: <span id="qr-size-label"></span>
-        <input id="qr-size" type="range" min="200" max="600" step="20" />
+        <input id="qr-size" type="range" min="200" max="1000" step="20" />
       </label>
       <label><input id="chunk-auto" type="checkbox" /> Auto Chunk Size</label>
       <label>Chunk Size: <span id="chunk-size-label"></span>
@@ -191,6 +192,7 @@ const warningMeta = getElement<HTMLDivElement>('#warning-meta');
 const wakeLockWarningEl = getElement<HTMLDivElement>('#wake-lock-warning');
 const startButton = getElement<HTMLButtonElement>('#start-btn');
 const stopButton = getElement<HTMLButtonElement>('#stop-btn');
+const clearButton = getElement<HTMLButtonElement>('#clear-btn');
 const resetButton = getElement<HTMLButtonElement>('#reset-btn');
 const qrCanvas = getElement<HTMLCanvasElement>('#qr-canvas');
 const stageEl = getElement<HTMLDivElement>('#stage');
@@ -388,7 +390,7 @@ errorCorrectionSelect.addEventListener('change', () => {
   persistAndRefresh();
 });
 qrSizeInput.addEventListener('input', () => {
-  settings.qrSizePx = clamp(Number(qrSizeInput.value), 200, 600);
+  settings.qrSizePx = clamp(Number(qrSizeInput.value), 200, 1000);
   persistAndRefresh();
 });
 chunkAutoInput.addEventListener('change', () => {
@@ -508,6 +510,13 @@ startButton.addEventListener('click', () => {
 });
 
 stopButton.addEventListener('click', () => stopTransmission());
+clearButton.addEventListener('click', () => {
+  stopTransmission('QR output cleared.', transmissionPlan ? 'READY' : 'NO_FILE');
+  const ctx = qrCanvas.getContext('2d');
+  ctx?.clearRect(0, 0, qrCanvas.width, qrCanvas.height);
+  packetMeta.textContent = transmissionPlan ? 'Ready to transmit' : 'No file selected';
+  warningMeta.textContent = '';
+});
 resetButton.addEventListener('click', () => {
   stopTransmission('No file selected', 'NO_FILE');
   transmissionPlan = null;

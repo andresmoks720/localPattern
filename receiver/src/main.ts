@@ -2,13 +2,26 @@ import './style.css';
 import jsQR from 'jsqr';
 import {
   ReceiverMachine,
+  FRAME_TYPE_DATA,
+  FRAME_TYPE_END,
+  FRAME_TYPE_HEADER,
+  MAGIC_BYTES,
   RECEIVER_ERROR_CODES,
+  parseFrame,
   type ReceiverSnapshot
 } from '@qr-data-bridge/protocol';
 import { ReceiverIngestService } from './ingestService';
 
 const SCAN_INTERVAL_MS = 300;
 const SIGNAL_LOST_MS = 5000;
+const ARMING_WINDOW_MS = 2000;
+const HEADER_CONFIRMATION_WINDOW_MS = 1500;
+const HEADER_CONFIRMATION_REQUIRED = 3;
+const MIN_QR_AREA_RATIO = 0.015;
+const MAX_AREA_DRIFT_RATIO = 0.4;
+const MAX_ASPECT_DRIFT_RATIO = 0.25;
+const MAX_CENTER_DRIFT_RATIO = 0.12;
+const STABLE_SCANS_REQUIRED = 2;
 const THEME_KEY = 'qdb_theme';
 
 const logger = {
@@ -80,6 +93,7 @@ app.innerHTML = `
     <label class="inline-check">Camera: <select id="camera-select"><option value="">Auto (rear)</option></select></label>
     <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Completion sound</label>
     <div id="status" class="status">Ready to scan</div>
+    <div id="lock-status">Searching for start frame...</div>
     <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
     <div id="progress-text">Waiting for header</div>
     <div id="scan-stats">Received 0 scans → 0 unique packets</div>
@@ -93,6 +107,7 @@ app.innerHTML = `
 
 const scanButton = getElement<HTMLButtonElement>('#scan-btn');
 const statusEl = getElement<HTMLDivElement>('#status');
+const lockStatusEl = getElement<HTMLDivElement>('#lock-status');
 const video = getElement<HTMLVideoElement>('#camera-preview');
 const progressBar = getElement<HTMLDivElement>('#progress-bar');
 const progressText = getElement<HTMLDivElement>('#progress-text');
@@ -122,6 +137,12 @@ let soundEnabled = false;
 let successSoundPlayed = false;
 let ingestDecodeError: string | null = null;
 let selectedCameraId = '';
+let armingWindowEndsAt = 0;
+let lockConfirmed = false;
+let headerConfirmationTimes: number[] = [];
+let pendingHeaderSignature = '';
+let stableGeometryCount = 0;
+let lastGeometry: { areaRatio: number; aspectRatio: number; centerX: number; centerY: number } | null = null;
 
 const receiverMachine = new ReceiverMachine();
 const receiverIngest = new ReceiverIngestService({
@@ -189,6 +210,72 @@ function updateProgress(snapshot: ReceiverSnapshot): void {
   scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets • dup:${diagnostics.duplicateScannerPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads}`;
 }
 
+function isProtocolPayload(rawPayload: Uint8Array): boolean {
+  return rawPayload.length > 5 && MAGIC_BYTES.every((byte, index) => rawPayload[index] === byte);
+}
+
+function headerSignature(frame: ReturnType<typeof parseFrame>): string {
+  if (frame.frameType !== FRAME_TYPE_HEADER) return '';
+  return `${frame.transferId.join(',')}|${frame.fileName}|${frame.fileSize}|${frame.totalPackets}|${frame.fileCrc32}`;
+}
+
+function polygonArea(points: Array<{ x: number; y: number }>): number {
+  let sum = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const next = points[(i + 1) % points.length];
+    sum += points[i].x * next.y;
+    sum -= next.x * points[i].y;
+  }
+  return Math.abs(sum / 2);
+}
+
+function hasStableQrGeometry(result: NonNullable<ReturnType<typeof jsQR>>, width: number, height: number): boolean {
+  const points = [
+    result.location.topLeftCorner,
+    result.location.topRightCorner,
+    result.location.bottomRightCorner,
+    result.location.bottomLeftCorner
+  ];
+  const qrArea = polygonArea(points);
+  const frameArea = width * height;
+  const areaRatio = frameArea > 0 ? qrArea / frameArea : 0;
+  if (areaRatio < MIN_QR_AREA_RATIO) {
+    stableGeometryCount = 0;
+    lastGeometry = null;
+    return false;
+  }
+
+  const topWidth = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+  const bottomWidth = Math.hypot(points[2].x - points[3].x, points[2].y - points[3].y);
+  const leftHeight = Math.hypot(points[3].x - points[0].x, points[3].y - points[0].y);
+  const rightHeight = Math.hypot(points[2].x - points[1].x, points[2].y - points[1].y);
+  const avgWidth = (topWidth + bottomWidth) / 2;
+  const avgHeight = (leftHeight + rightHeight) / 2;
+  const aspectRatio = avgHeight > 0 ? avgWidth / avgHeight : 0;
+  const centerX = points.reduce((sum, point) => sum + point.x, 0) / points.length / width;
+  const centerY = points.reduce((sum, point) => sum + point.y, 0) / points.length / height;
+
+  const currentGeometry = { areaRatio, aspectRatio, centerX, centerY };
+  if (!lastGeometry) {
+    lastGeometry = currentGeometry;
+    stableGeometryCount = 1;
+    return false;
+  }
+
+  const areaDeltaRatio = Math.abs(currentGeometry.areaRatio - lastGeometry.areaRatio) / lastGeometry.areaRatio;
+  const aspectDelta = Math.abs(currentGeometry.aspectRatio - lastGeometry.aspectRatio);
+  const centerDelta = Math.hypot(currentGeometry.centerX - lastGeometry.centerX, currentGeometry.centerY - lastGeometry.centerY);
+
+  if (areaDeltaRatio <= MAX_AREA_DRIFT_RATIO && aspectDelta <= MAX_ASPECT_DRIFT_RATIO && centerDelta <= MAX_CENTER_DRIFT_RATIO) {
+    stableGeometryCount += 1;
+  } else {
+    stableGeometryCount = 1;
+  }
+
+  lastGeometry = currentGeometry;
+  return stableGeometryCount >= STABLE_SCANS_REQUIRED;
+}
+
 function setStage(state: ReceiverSnapshot['state'], label: string): void {
   panel.dataset.state = state;
   statusEl.textContent = label;
@@ -212,11 +299,13 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
 
   if (snapshot.state === 'IDLE') {
     setStage('IDLE', 'Ready to scan');
+    lockStatusEl.textContent = 'Searching for start frame...';
     return;
   }
 
   if (snapshot.state === 'SCANNING') {
-    setStage('SCANNING', 'Waiting for header');
+    setStage('SCANNING', lockConfirmed ? 'Start frame confirmed' : 'Searching for start frame...');
+    lockStatusEl.textContent = lockConfirmed ? 'Start frame confirmed.' : 'Searching for start frame...';
     if (!warningEl.textContent.startsWith('Signal Lost')) {
       warningEl.textContent = '';
     }
@@ -225,6 +314,7 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
 
   if (snapshot.state === 'RECEIVING') {
     setStage('RECEIVING', 'Receiving packets');
+    lockStatusEl.textContent = 'Start frame confirmed.';
     if (snapshot.fileName && snapshot.totalPackets !== null && snapshot.expectedFileSize !== null) {
       lastPacketEl.textContent = `${snapshot.fileName} • ${snapshot.expectedFileSize} bytes • ${snapshot.totalPackets} packets`;
     }
@@ -233,11 +323,13 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
 
   if (snapshot.state === 'VERIFYING') {
     setStage('VERIFYING', 'Verifying');
+    lockStatusEl.textContent = 'Start frame confirmed.';
     return;
   }
 
   if (snapshot.state === 'SUCCESS') {
     setStage('SUCCESS', 'File ready');
+    lockStatusEl.textContent = 'Start frame confirmed.';
     warningEl.textContent = '';
     applyDownload(snapshot);
     if (!successSoundPlayed) {
@@ -251,6 +343,7 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
   }
 
   const code = snapshot.error?.code;
+  lockStatusEl.textContent = lockConfirmed ? 'Start frame confirmed.' : 'Searching for start frame...';
   setStage('ERROR', code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH ? 'Decode error' : 'Transfer incomplete, restart sender');
   if (code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
     warningEl.textContent = 'Corruption error: file CRC32 mismatch detected. Retry with slower frame rate.';
@@ -274,6 +367,13 @@ function resetUiForNewScan(): void {
   lastPacketEl.textContent = '';
   lastPacketAt = 0;
   lastReceivedTimeEl.textContent = 'Last packet: -';
+  armingWindowEndsAt = Date.now() + ARMING_WINDOW_MS;
+  lockConfirmed = false;
+  headerConfirmationTimes = [];
+  pendingHeaderSignature = '';
+  stableGeometryCount = 0;
+  lastGeometry = null;
+  lockStatusEl.textContent = 'Searching for start frame...';
   applySnapshot(receiverMachine.snapshot);
 }
 
@@ -295,8 +395,57 @@ function processFrame(now: number): void {
   const image = frameContext.getImageData(0, 0, frameCanvas.width, frameCanvas.height);
   const result = jsQR(image.data, image.width, image.height);
 
-  if (result?.binaryData?.length) {
-    void receiverIngest.enqueue(Uint8Array.from(result.binaryData), Date.now()).then((snapshot) => {
+  if (result?.binaryData?.length && hasStableQrGeometry(result, image.width, image.height)) {
+    const nowMs = Date.now();
+    const rawPayload = Uint8Array.from(result.binaryData);
+    if (!isProtocolPayload(rawPayload)) {
+      rafId = requestAnimationFrame(processFrame);
+      return;
+    }
+
+    let parsedFrame: ReturnType<typeof parseFrame>;
+    try {
+      parsedFrame = parseFrame(rawPayload);
+    } catch {
+      rafId = requestAnimationFrame(processFrame);
+      return;
+    }
+
+    const inArmingWindow = nowMs < armingWindowEndsAt;
+
+    if (!lockConfirmed) {
+      if (parsedFrame.frameType !== FRAME_TYPE_HEADER) {
+        rafId = requestAnimationFrame(processFrame);
+        return;
+      }
+
+      const signature = headerSignature(parsedFrame);
+      if (signature !== pendingHeaderSignature) {
+        pendingHeaderSignature = signature;
+        headerConfirmationTimes = [nowMs];
+        rafId = requestAnimationFrame(processFrame);
+        return;
+      }
+
+      headerConfirmationTimes = headerConfirmationTimes
+        .filter((observedAt) => nowMs - observedAt <= HEADER_CONFIRMATION_WINDOW_MS);
+      headerConfirmationTimes.push(nowMs);
+
+      if (headerConfirmationTimes.length < HEADER_CONFIRMATION_REQUIRED) {
+        rafId = requestAnimationFrame(processFrame);
+        return;
+      }
+
+      lockConfirmed = true;
+      lockStatusEl.textContent = 'Start frame confirmed.';
+    }
+
+    if (inArmingWindow && (parsedFrame.frameType === FRAME_TYPE_DATA || parsedFrame.frameType === FRAME_TYPE_END)) {
+      rafId = requestAnimationFrame(processFrame);
+      return;
+    }
+
+    void receiverIngest.enqueue(rawPayload, nowMs).then((snapshot) => {
       if (snapshot) {
         applySnapshot(snapshot);
         lastPacketAt = Date.now();
@@ -382,6 +531,7 @@ async function startScan(): Promise<void> {
     await video.play();
     await populateCameraOptions();
     setStage('SCANNING', 'Waiting for header');
+    lockStatusEl.textContent = 'Searching for start frame...';
     lastScanAt = 0;
     scanStartedAt = Date.now();
     scanButton.textContent = 'Stop Scan';
