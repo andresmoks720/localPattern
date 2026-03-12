@@ -26,6 +26,7 @@ export type ReceiverIngestEvent =
 interface PendingIngestion {
   rawPayload: Uint8Array;
   now: number;
+  dedupeKey: string;
 }
 
 interface ScannerKeyEntry {
@@ -73,6 +74,8 @@ export class ReceiverIngestService {
 
   private readonly pendingIngestions: PendingIngestion[] = [];
 
+  private readonly pendingKeyToIndex = new Map<string, number>();
+
   constructor(
     private readonly deps: {
       machine: ReceiverMachine;
@@ -88,6 +91,7 @@ export class ReceiverIngestService {
     this.recentPayloadOrder.length = 0;
     this.firstAcceptedAt = null;
     this.pendingIngestions.length = 0;
+    this.pendingKeyToIndex.clear();
     this.ingestionChain = Promise.resolve(null);
     this.diagnosticsValue = {
       totalPayloadsSeen: 0,
@@ -107,16 +111,51 @@ export class ReceiverIngestService {
   }
 
   public enqueue(rawPayload: Uint8Array, now: number): Promise<ReceiverSnapshot | null> {
+    const dedupeKey = scannerPayloadKey(rawPayload);
+    const windowMs = this.deps.scannerDedupeWindowMs ?? DEFAULT_SCANNER_DEDUPE_WINDOW_MS;
+    let allowForHeaderLockDuplicates = false;
+    try {
+      const frame = parseFrame(rawPayload);
+      allowForHeaderLockDuplicates = frame.frameType === FRAME_TYPE_HEADER && !this.deps.machine.snapshot.lockConfirmed;
+    } catch {
+      allowForHeaderLockDuplicates = false;
+    }
+
+    if (this.deps.scannerDedupeEnabled ?? true) {
+      this.pruneDedupeWindow(now);
+      const seenAt = this.recentPayloads.get(dedupeKey);
+      if (seenAt !== undefined && now - seenAt <= windowMs) {
+        if (!allowForHeaderLockDuplicates) {
+          this.diagnosticsValue.duplicateScannerPayloads += 1;
+          this.deps.onEvent?.({ type: 'duplicateScannerPayload' });
+          return Promise.resolve(null);
+        }
+      }
+    }
+
+    const existingIndex = this.pendingKeyToIndex.get(dedupeKey);
+    if (existingIndex !== undefined && !allowForHeaderLockDuplicates) {
+      this.pendingIngestions.splice(existingIndex, 1);
+      this.reindexPendingKeysFrom(existingIndex);
+    }
+
     const maxPendingIngestions = this.deps.maxPendingIngestions ?? DEFAULT_MAX_PENDING_INGESTIONS;
     if (this.pendingIngestions.length >= maxPendingIngestions) {
-      this.pendingIngestions.shift();
+      const removed = this.pendingIngestions.shift();
+      if (removed) {
+        this.pendingKeyToIndex.delete(removed.dedupeKey);
+      }
+      this.reindexPendingKeysFrom(0);
       this.diagnosticsValue.droppedQueuedPayloads += 1;
     }
-    this.pendingIngestions.push({ rawPayload, now });
+    this.pendingIngestions.push({ rawPayload, now, dedupeKey });
+    this.pendingKeyToIndex.set(dedupeKey, this.pendingIngestions.length - 1);
 
     this.ingestionChain = this.ingestionChain.then(async () => {
       const next = this.pendingIngestions.shift();
       if (!next) return null;
+      this.pendingKeyToIndex.delete(next.dedupeKey);
+      this.reindexPendingKeysFrom(0);
       return this.ingestNow(next.rawPayload, next.now);
     });
     return this.ingestionChain;
@@ -203,6 +242,12 @@ export class ReceiverIngestService {
       if (currentSeenAt === first.seenAt) {
         this.recentPayloads.delete(first.key);
       }
+    }
+  }
+
+  private reindexPendingKeysFrom(startIndex: number): void {
+    for (let i = startIndex; i < this.pendingIngestions.length; i += 1) {
+      this.pendingKeyToIndex.set(this.pendingIngestions[i].dedupeKey, i);
     }
   }
 }

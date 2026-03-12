@@ -268,7 +268,7 @@ function updateProgress(snapshot: ReceiverSnapshot): void {
   }
 
   const diagnostics = receiverIngest.getDiagnostics();
-  scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets • dup:${diagnostics.duplicateScannerPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads}`;
+  scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets • dup:${diagnostics.duplicateScannerPayloads} queuedDrop:${diagnostics.droppedQueuedPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads}`;
 
   if (diagnostics.foreignTransferFrames > 0) {
     diagnosticHintEl.textContent = 'Hint: multiple senders/QR streams detected. Keep only one sender QR visible.';

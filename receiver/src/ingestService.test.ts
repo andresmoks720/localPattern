@@ -155,6 +155,57 @@ describe('ReceiverIngestService', () => {
     expect(diagnostics.finalizeDurationMs).toBe(20);
     expect(durations).toEqual([20]);
   });
+
+
+  it('coalesces queued duplicates so unique frames survive overload and complete transfer', async () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({
+      machine,
+      maxPendingIngestions: 8
+    });
+
+    const bytes = new Uint8Array(Array.from({ length: 18 }, (_, i) => i + 1));
+    const transfer = chunkFile(bytes, {
+      fileName: 'overload.bin',
+      maxPayloadSize: 3,
+      includeEndFrame: true
+    });
+
+    const headerPayload = assembleFrame(transfer.header);
+    const duplicateDataPayload = assembleFrame(transfer.dataFrames[0]);
+    const uniquePayloads = [
+      ...transfer.dataFrames.slice(1).map((frame) => assembleFrame(frame)),
+      ...(transfer.endFrame ? [assembleFrame(transfer.endFrame)] : [])
+    ];
+
+    for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+      await service.enqueue(headerPayload, 1000 + i);
+    }
+
+    await service.enqueue(duplicateDataPayload, 1099);
+
+    const queued: Array<Promise<unknown>> = [];
+    let now = 1100;
+    for (const uniquePayload of uniquePayloads) {
+      for (let i = 0; i < 20; i += 1) {
+        queued.push(service.enqueue(duplicateDataPayload, now));
+        now += 1;
+      }
+      queued.push(service.enqueue(uniquePayload, now));
+      now += 1;
+    }
+
+    await Promise.all(queued);
+
+    const snapshot = machine.snapshot;
+    expect(snapshot.state).toBe('SUCCESS');
+    expect(snapshot.receivedCount).toBe(transfer.header.totalPackets);
+
+    const diagnostics = service.getDiagnostics();
+    expect(diagnostics.duplicateScannerPayloads).toBeGreaterThan(0);
+  });
+
   it('bounds pending ingestion queue to prevent unbounded scan callback growth', async () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
