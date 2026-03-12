@@ -151,7 +151,7 @@ app.innerHTML = `
     <input id="file-input" type="file" />
     <button id="start-btn" type="button" disabled>Start Transmission</button>
     <button id="stop-btn" type="button" disabled>Stop</button>
-    <button id="clear-btn" type="button">Clear QR</button>
+    <button id="clear-btn" type="button" data-persistent-control="true">Clear QR</button>
     <button id="reset-btn" type="button">Reset</button>
     <details>
       <summary>Settings</summary>
@@ -381,6 +381,14 @@ function stopTransmission(message = 'Transmission stopped.', stage: SenderStage 
   transmissionService.stop(message, stage);
 }
 
+function clearQrOutput(message = 'QR output cleared.'): void {
+  stopTransmission(message, transmissionPlan ? 'READY' : 'NO_FILE');
+  const ctx = qrCanvas.getContext('2d');
+  ctx?.clearRect(0, 0, qrCanvas.width, qrCanvas.height);
+  packetMeta.textContent = transmissionPlan ? 'Ready to transmit' : 'No file selected';
+  warningMeta.textContent = '';
+}
+
 frameDurationInput.addEventListener('input', () => {
   settings.frameDurationMs = clamp(Number(frameDurationInput.value), 500, 5000);
   persistAndRefresh();
@@ -510,15 +518,9 @@ startButton.addEventListener('click', () => {
 });
 
 stopButton.addEventListener('click', () => stopTransmission());
-clearButton.addEventListener('click', () => {
-  stopTransmission('QR output cleared.', transmissionPlan ? 'READY' : 'NO_FILE');
-  const ctx = qrCanvas.getContext('2d');
-  ctx?.clearRect(0, 0, qrCanvas.width, qrCanvas.height);
-  packetMeta.textContent = transmissionPlan ? 'Ready to transmit' : 'No file selected';
-  warningMeta.textContent = '';
-});
+clearButton.addEventListener('click', () => clearQrOutput());
 resetButton.addEventListener('click', () => {
-  stopTransmission('No file selected', 'NO_FILE');
+  clearQrOutput('No file selected');
   transmissionPlan = null;
   totalDataPackets = 0;
   fileBytes = null;
