@@ -1,4 +1,5 @@
 import { FRAME_TYPE_DATA, type TransferFrame } from '@qr-data-bridge/protocol';
+import type { SenderStreamFrame } from './senderCore';
 
 export type SenderStage = 'NO_FILE' | 'READY' | 'COUNTDOWN' | 'TRANSMITTING' | 'COMPLETE' | 'ERROR';
 
@@ -13,7 +14,7 @@ export const SENDER_STAGE_TRANSITIONS: Record<SenderStage, SenderStage[]> = {
 
 export interface SenderTransmissionEventMap {
   stageChanged: { stage: SenderStage; message?: string };
-  frameRendered: { index: number; frame: TransferFrame };
+  frameRendered: { index: number; frame: SenderStreamFrame };
   complete: { totalFrames: number };
   failed: { message: string };
 }
@@ -30,8 +31,10 @@ export interface SenderTransmissionDiagnostics {
 }
 
 interface SenderTransmissionDeps {
-  getFrameDisplayDurationMs(frame: TransferFrame): number;
-  renderFrame(index: number, frame: TransferFrame): Promise<void>;
+  getTotalFrames(): number;
+  getFrameAt(index: number): SenderStreamFrame | null;
+  getFrameDisplayDurationMs(frame: SenderStreamFrame): number;
+  renderFrame(index: number, frame: SenderStreamFrame): Promise<void>;
   requestWakeLock(): Promise<void>;
   releaseWakeLock(): void;
   onEvent?: (event: SenderTransmissionEvent) => void;
@@ -42,19 +45,11 @@ interface SenderTransmissionDeps {
 
 export class SenderTransmissionService {
   private readonly deps: Required<Omit<SenderTransmissionDeps, 'onEvent'>> & Pick<SenderTransmissionDeps, 'onEvent'>;
-
-  private streamFrames: TransferFrame[] = [];
-
   private currentIndex = 0;
-
   private stage: SenderStage = 'NO_FILE';
-
   private transmissionTimer: number | null = null;
-
   private countdownTimer: number | null = null;
-
   private isTransmitting = false;
-
   private diagnosticsValue: SenderTransmissionDiagnostics = {
     framesRendered: 0,
     dataFramesRendered: 0,
@@ -73,12 +68,11 @@ export class SenderTransmissionService {
     };
   }
 
-  public loadFrames(frames: TransferFrame[]): void {
+  public loadTransfer(): void {
     this.stop('Transmission stopped.', 'READY');
-    this.streamFrames = frames;
     this.currentIndex = 0;
     this.diagnosticsValue = { framesRendered: 0, dataFramesRendered: 0, startedAt: null, completedAt: null };
-    this.transition(frames.length ? 'READY' : 'NO_FILE', frames.length ? 'Ready to transmit' : 'No file selected');
+    this.transition(this.deps.getTotalFrames() ? 'READY' : 'NO_FILE', this.deps.getTotalFrames() ? 'Ready to transmit' : 'No file selected');
   }
 
   public getStage(): SenderStage {
@@ -94,7 +88,7 @@ export class SenderTransmissionService {
   }
 
   public start(): void {
-    if (!this.streamFrames.length) return;
+    if (!this.deps.getTotalFrames()) return;
     this.stop('Transmission stopped.', 'READY');
     this.isTransmitting = true;
     this.currentIndex = 0;
@@ -110,14 +104,13 @@ export class SenderTransmissionService {
     this.countdownTimer = null;
     this.isTransmitting = false;
     this.deps.releaseWakeLock();
-    if (this.streamFrames.length > 0) {
+    if (this.deps.getTotalFrames() > 0) {
       this.transition(stage, message);
     }
   }
 
   public reset(): void {
     this.stop('No file selected', 'NO_FILE');
-    this.streamFrames = [];
     this.currentIndex = 0;
     this.diagnosticsValue = { framesRendered: 0, dataFramesRendered: 0, startedAt: null, completedAt: null };
     this.transition('NO_FILE', 'No file selected');
@@ -154,15 +147,21 @@ export class SenderTransmissionService {
   }
 
   private scheduleNextFrame(): void {
-    if (!this.isTransmitting || this.streamFrames.length === 0) return;
-    const currentFrame = this.streamFrames[this.currentIndex];
+    const totalFrames = this.deps.getTotalFrames();
+    if (!this.isTransmitting || totalFrames === 0) return;
+    const currentFrame = this.deps.getFrameAt(this.currentIndex);
+    if (!currentFrame) {
+      this.fail('Error: QR encode failed: stream frame unavailable.');
+      return;
+    }
+
     this.transmissionTimer = this.deps.setTimeoutFn(async () => {
       if (!this.isTransmitting) return;
       const nextIndex = this.currentIndex + 1;
-      if (nextIndex >= this.streamFrames.length) {
+      if (nextIndex >= totalFrames) {
         this.diagnosticsValue.completedAt = this.deps.now();
         this.stop('Transmission finished. If receiver did not complete, restart sender.', 'COMPLETE');
-        this.emit({ type: 'complete', payload: { totalFrames: this.streamFrames.length } });
+        this.emit({ type: 'complete', payload: { totalFrames } });
         return;
       }
 
@@ -177,7 +176,10 @@ export class SenderTransmissionService {
   }
 
   private async renderCurrentFrame(): Promise<void> {
-    const frame = this.streamFrames[this.currentIndex];
+    const frame = this.deps.getFrameAt(this.currentIndex);
+    if (!frame) {
+      throw new Error('stream frame unavailable.');
+    }
     await this.deps.renderFrame(this.currentIndex, frame);
     this.diagnosticsValue.framesRendered += 1;
     if (frame.frameType === FRAME_TYPE_DATA) this.diagnosticsValue.dataFramesRendered += 1;

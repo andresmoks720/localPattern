@@ -310,15 +310,14 @@ MVPv2 must not use:
 - No continuous `HEADER` / `END` loops.
 - No waiting for receiver confirmation.
 
-### Sender timing assumptions (MVPv2 fixed behavior)
-- MVPv2 ships with one fixed `DATA` frame display duration default: **2000 ms**.
-- MVPv2 does not expose advanced timing controls in UI.
-- Implementations may keep an internal bounded constant range for experiments, but production MVPv2 behavior must use a fixed default and must not expose frame timing as an open-ended user knob.
+### Sender timing assumptions (MVPv2 behavior)
+- MVPv2 default `DATA` frame display duration is **2000 ms**.
+- Sender may expose a bounded frame-duration slider in UI (500-5000 ms), and estimates/scheduling must reflect the selected value.
 
-### Frame preparation and caching
-- Sender must precompute packetization and frame payloads before transmission starts.
-- Sender must avoid rebuilding packet content on every render tick if it can be prepared once.
-- Cached frame preparation must not change protocol behavior; it is a sender performance optimization only.
+### Frame preparation and memory model
+- Sender must keep exactly one long-lived transfer representation: file bytes + compact packet metadata (offsets, lengths, CRCs, transfer metadata).
+- Sender should assemble DATA frame bytes on demand using `Uint8Array.subarray(...)` views (avoid per-packet payload copies).
+- Sender must not persist full-frame image/data-url caches across the transfer lifecycle.
 
 ### Settings preflight validation
 Before entering `READY`, sender must validate that:
@@ -666,7 +665,7 @@ On reset, new attempt, or teardown, the app must explicitly clean up any attempt
 
 ### Sender cleanup
 - clear timers/timeouts
-- clear cached frame payloads
+- clear compact packet plan state and transient render artifacts
 - clear active transfer state
 - clear progress state
 - release wake/visibility-linked resources if used

@@ -196,9 +196,7 @@ function setStage(state: ReceiverSnapshot['state'], label: string): void {
 
 function applyDownload(snapshot: ReceiverSnapshot): void {
   if (!snapshot.fileBytes || downloadUrl) return;
-  const blobData = new Uint8Array(snapshot.fileBytes.length);
-  blobData.set(snapshot.fileBytes);
-  downloadUrl = URL.createObjectURL(new Blob([blobData.buffer], { type: 'application/octet-stream' }));
+  downloadUrl = URL.createObjectURL(new Blob([snapshot.fileBytes.buffer as ArrayBuffer], { type: 'application/octet-stream' }));
   downloadButton.disabled = false;
   downloadButton.onclick = () => {
     if (!downloadUrl) return;

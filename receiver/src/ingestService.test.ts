@@ -145,4 +145,32 @@ describe('ReceiverIngestService', () => {
     expect(diagnostics.finalizeDurationMs).toBe(20);
     expect(durations).toEqual([20]);
   });
+  it('bounds pending ingestion queue to prevent unbounded scan callback growth', async () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({
+      machine,
+      maxPendingIngestions: 2
+    });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), {
+      fileName: 'bounded.bin',
+      maxPayloadSize: 2,
+      includeEndFrame: true
+    });
+
+    const headerPayload = assembleFrame(transfer.header);
+    const dataPayload0 = assembleFrame(transfer.dataFrames[0]);
+    const dataPayload1 = assembleFrame(transfer.dataFrames[1]);
+
+    const p1 = service.enqueue(headerPayload, 1000);
+    const p2 = service.enqueue(dataPayload0, 1010);
+    const p3 = service.enqueue(dataPayload1, 1020);
+
+    await Promise.all([p1, p2, p3]);
+
+    const diagnostics = service.getDiagnostics();
+    expect(diagnostics.droppedQueuedPayloads).toBe(1);
+  });
+
 });
