@@ -201,13 +201,18 @@ describe('receiver machine', () => {
     expect(snapshot.endSeenAt).toBeNull();
   });
 
-  it('handles zero timestamps for timeout bookkeeping', () => {
+  it('does not trigger no-progress timeout before first unique packet', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'zero-time.bin', maxPayloadSize: 2, includeEndFrame: true });
     machine.startScanning();
     confirmHeaderLock(machine, transfer.header, 0);
 
-    const snapshot = machine.tick(RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS);
+    const stillReceiving = machine.tick(RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS);
+    expect(stillReceiving.state).toBe('RECEIVING');
+    expect(stillReceiving.error).toBeUndefined();
+
+    machine.applyFrame(transfer.dataFrames[0], 5);
+    const snapshot = machine.tick(5 + RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS + 1);
     expect(snapshot.state).toBe('ERROR');
     expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT);
   });

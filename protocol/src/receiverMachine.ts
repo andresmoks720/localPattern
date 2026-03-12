@@ -302,7 +302,7 @@ export class ReceiverMachine {
     this.snapshotValue.expectedFileSize = frame.fileSize;
     this.snapshotValue.totalPackets = frame.totalPackets;
     this.snapshotValue.fileCrc32 = frame.fileCrc32;
-    this.snapshotValue.lastUniquePacketAt = now;
+    this.snapshotValue.lastUniquePacketAt = null;
     this.snapshotValue.lastLockedTransferFrameAt = now;
     this.packetPayloads = Array.from({ length: frame.totalPackets }, () => null);
     this.packetSeen = new Uint8Array(Math.ceil(frame.totalPackets / 8));

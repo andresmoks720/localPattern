@@ -87,27 +87,32 @@ app.innerHTML = `
     </div>
   </section>
   <aside class="panel" id="receiver-panel" data-state="IDLE">
-    <div class="row">
-      <button id="scan-btn" type="button">Start Scan</button>
-      <button id="theme-btn" type="button">Theme</button>
+    <div class="panel-body">
+      <div class="side-buttons">
+        <button id="scan-btn" type="button">Start Scan</button>
+        <button id="download-btn" type="button" disabled>Download File</button>
+        <button id="copy-events-btn" type="button">Copy Event Timeline</button>
+        <button id="theme-btn" type="button">Theme</button>
+      </div>
+      <div class="panel-content">
+        <label class="inline-check">Camera: <select id="camera-select"><option value="">Auto (rear)</option></select></label>
+        <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Completion sound</label>
+        <div id="status" class="status">Ready to scan</div>
+        <div id="lock-status">Searching for start frame...</div>
+        <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
+        <div id="progress-text">Waiting for header</div>
+        <div id="scan-stats">Received 0 scans → 0 unique packets</div>
+        <div id="diagnostic-hint">Diagnostics: waiting for scan data.</div>
+        <div id="progress-health">Progress health: waiting for first frame…</div>
+        <div id="last-received-time">Last packet: -</div>
+        <label class="inline-check"><input id="debug-log-enabled" type="checkbox"/> Debug event log</label>
+        <details id="debug-log-panel" class="debug-log" hidden>
+          <summary>Receiver event timeline</summary>
+          <pre id="debug-log-output">No events yet.</pre>
+        </details>
+        <div id="warning" class="warning"></div>
+      </div>
     </div>
-    <label class="inline-check">Camera: <select id="camera-select"><option value="">Auto (rear)</option></select></label>
-    <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Completion sound</label>
-    <div id="status" class="status">Ready to scan</div>
-    <div id="lock-status">Searching for start frame...</div>
-    <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
-    <div id="progress-text">Waiting for header</div>
-    <div id="scan-stats">Received 0 scans → 0 unique packets</div>
-    <div id="diagnostic-hint">Diagnostics: waiting for scan data.</div>
-    <div id="progress-health">Progress health: waiting for first frame…</div>
-    <div id="last-received-time">Last packet: -</div>
-    <label class="inline-check"><input id="debug-log-enabled" type="checkbox"/> Debug event log</label>
-    <details id="debug-log-panel" class="debug-log" hidden>
-      <summary>Receiver event timeline</summary>
-      <pre id="debug-log-output">No events yet.</pre>
-    </details>
-    <div id="warning" class="warning"></div>
-    <button id="download-btn" type="button" disabled>Download File</button>
     <div class="hint">Tap Start Scan (required on iOS). Keep QR fully visible, hold both devices steady, move closer if scans fail, use fullscreen, and remember larger files are slower.</div>
     <div id="last-packet"></div>
   </aside>
@@ -133,6 +138,7 @@ const cameraSelect = getElement<HTMLSelectElement>('#camera-select');
 const debugLogEnabledInput = getElement<HTMLInputElement>('#debug-log-enabled');
 const debugLogPanel = getElement<HTMLDetailsElement>('#debug-log-panel');
 const debugLogOutput = getElement<HTMLPreElement>('#debug-log-output');
+const copyEventsButton = getElement<HTMLButtonElement>('#copy-events-btn');
 
 const frameCanvas = document.createElement('canvas');
 const frameContextCandidate = frameCanvas.getContext('2d', { willReadFrequently: true });
@@ -720,6 +726,16 @@ debugLogEnabledInput.addEventListener('change', () => {
   debugLogPanel.hidden = !debugLogEnabled;
   if (debugLogEnabled) {
     debugLogOutput.textContent = debugEventLines.length > 0 ? debugEventLines.join('\n') : 'No events yet.';
+  }
+});
+
+copyEventsButton.addEventListener('click', async () => {
+  const timeline = debugEventLines.length > 0 ? debugEventLines.join('\n') : 'No events yet.';
+  try {
+    await navigator.clipboard.writeText(timeline);
+    warningEl.textContent = `Copied ${debugEventLines.length} receiver timeline event${debugEventLines.length === 1 ? '' : 's'} to clipboard.`;
+  } catch {
+    warningEl.textContent = 'Unable to copy event timeline. Your browser blocked clipboard access.';
   }
 });
 
