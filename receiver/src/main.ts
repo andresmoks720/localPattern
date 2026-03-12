@@ -185,13 +185,12 @@ const receiverIngest = new ReceiverIngestService({
     }
 
     if (event.type === 'frameAccepted') {
-      if (event.frame.frameType === FRAME_TYPE_HEADER) {
-        appendDebugEvent(`Frame accepted: HEADER ${shortTransferId(event.snapshot.transferId)}`);
-      } else if (event.frame.frameType === FRAME_TYPE_DATA) {
-        appendDebugEvent(`Frame accepted: DATA packet ${event.frame.packetIndex}`);
-      } else if (event.frame.frameType === FRAME_TYPE_END) {
-        appendDebugEvent('Frame accepted: END');
-      }
+      appendDebugEvent(`Frame accepted: (${shortTransferId(event.tuple.sessionId)}, ${event.tuple.streamId}, ${event.tuple.seq})`);
+      return;
+    }
+
+    if (event.type === 'frameDropped') {
+      appendDebugEvent(`Frame dropped (${event.reason}): (${shortTransferId(event.tuple.sessionId)}, ${event.tuple.streamId}, ${event.tuple.seq})`);
       return;
     }
 

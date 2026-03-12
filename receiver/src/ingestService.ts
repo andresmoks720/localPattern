@@ -1,4 +1,4 @@
-import { FRAME_TYPE_HEADER, MAGIC_BYTES, PROTOCOL_ERROR_CODES, ProtocolError, parseFrame, type ReceiverMachine, type ReceiverSnapshot, type TransferFrame } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_DATA, FRAME_TYPE_HEADER, MAGIC_BYTES, PROTOCOL_ERROR_CODES, ProtocolError, parseFrame, type ReceiverMachine, type ReceiverSnapshot, type TransferFrame } from '@qr-data-bridge/protocol';
 
 const DEFAULT_SCANNER_DEDUPE_WINDOW_MS = 4000;
 const DEFAULT_MAX_PENDING_INGESTIONS = 64;
@@ -16,12 +16,19 @@ export interface ReceiverIngestDiagnostics {
 }
 
 export type ReceiverIngestEvent =
-  | { type: 'frameAccepted'; frame: TransferFrame; snapshot: ReceiverSnapshot }
+  | { type: 'frameAccepted'; frame: TransferFrame; snapshot: ReceiverSnapshot; tuple: FrameTuple }
+  | { type: 'frameDropped'; reason: 'duplicateScannerPayload' | 'foreignTransferFrame' | 'replayedSequence'; tuple: FrameTuple }
   | { type: 'decodeError'; message: string }
   | { type: 'duplicateScannerPayload' }
   | { type: 'foreignFrameIgnored' }
   | { type: 'badPacketCrcIgnored' }
   | { type: 'completed'; durationMs: number };
+
+interface FrameTuple {
+  sessionId: string;
+  streamId: 'HEADER' | 'DATA' | 'END';
+  seq: number;
+}
 
 interface PendingIngestion {
   rawPayload: Uint8Array;
@@ -76,6 +83,8 @@ export class ReceiverIngestService {
 
   private readonly pendingKeyToIndex = new Map<string, number>();
 
+  private readonly lastAcceptedSeqBySessionStream = new Map<string, number>();
+
   constructor(
     private readonly deps: {
       machine: ReceiverMachine;
@@ -92,6 +101,7 @@ export class ReceiverIngestService {
     this.firstAcceptedAt = null;
     this.pendingIngestions.length = 0;
     this.pendingKeyToIndex.clear();
+    this.lastAcceptedSeqBySessionStream.clear();
     this.ingestionChain = Promise.resolve(null);
     this.diagnosticsValue = {
       totalPayloadsSeen: 0,
@@ -189,25 +199,48 @@ export class ReceiverIngestService {
     try {
       const frame = parseFrame(rawPayload);
       const before = this.deps.machine.snapshot;
+      const tuple = frameTuple(frame);
 
       if (duplicateScannerPayload) {
         const allowForHeaderLock = frame.frameType === FRAME_TYPE_HEADER && !before.lockConfirmed;
         if (!allowForHeaderLock) {
           this.diagnosticsValue.duplicateScannerPayloads += 1;
           this.deps.onEvent?.({ type: 'duplicateScannerPayload' });
+          this.deps.onEvent?.({ type: 'frameDropped', reason: 'duplicateScannerPayload', tuple });
           return null;
         }
       }
-      const snapshot = this.deps.machine.applyFrame(frame, now);
 
-      if (before.transferId && transferIdToHex(frame.transferId) !== before.transferId) {
+      if (before.lockConfirmed && before.transferId && tuple.sessionId !== before.transferId) {
         this.diagnosticsValue.foreignTransferFrames += 1;
         this.deps.onEvent?.({ type: 'foreignFrameIgnored' });
+        this.deps.onEvent?.({ type: 'frameDropped', reason: 'foreignTransferFrame', tuple });
+        return null;
+      }
+
+      if (frame.frameType === FRAME_TYPE_DATA && before.lockConfirmed && before.transferId) {
+        const sequenceKey = `${tuple.sessionId}|${tuple.streamId}`;
+        const lastAcceptedSeq = this.lastAcceptedSeqBySessionStream.get(sequenceKey);
+        if (lastAcceptedSeq !== undefined && tuple.seq <= lastAcceptedSeq) {
+          this.deps.onEvent?.({ type: 'frameDropped', reason: 'replayedSequence', tuple });
+          return null;
+        }
+      }
+
+      const snapshot = this.deps.machine.applyFrame(frame, now);
+
+      if (!before.lockConfirmed && snapshot.lockConfirmed && snapshot.transferId) {
+        this.lastAcceptedSeqBySessionStream.clear();
+      }
+
+      if (snapshot.lockConfirmed || frame.frameType === FRAME_TYPE_HEADER) {
+        const sequenceKey = `${tuple.sessionId}|${tuple.streamId}`;
+        this.lastAcceptedSeqBySessionStream.set(sequenceKey, tuple.seq);
       }
 
       this.diagnosticsValue.acceptedFrames += 1;
       this.firstAcceptedAt = this.firstAcceptedAt ?? now;
-      this.deps.onEvent?.({ type: 'frameAccepted', frame, snapshot });
+      this.deps.onEvent?.({ type: 'frameAccepted', frame, snapshot, tuple });
 
       if (snapshot.state === 'SUCCESS' && this.firstAcceptedAt !== null && this.diagnosticsValue.finalizeDurationMs === null) {
         this.diagnosticsValue.finalizeDurationMs = now - this.firstAcceptedAt;
@@ -250,4 +283,14 @@ export class ReceiverIngestService {
       this.pendingKeyToIndex.set(this.pendingIngestions[i].dedupeKey, i);
     }
   }
+}
+
+function frameTuple(frame: TransferFrame): FrameTuple {
+  if (frame.frameType === FRAME_TYPE_HEADER) {
+    return { sessionId: transferIdToHex(frame.transferId), streamId: 'HEADER', seq: 0 };
+  }
+  if (frame.frameType === FRAME_TYPE_DATA) {
+    return { sessionId: transferIdToHex(frame.transferId), streamId: 'DATA', seq: frame.packetIndex };
+  }
+  return { sessionId: transferIdToHex(frame.transferId), streamId: 'END', seq: 0 };
 }
