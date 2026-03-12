@@ -173,7 +173,26 @@ function appendDebugEvent(message: string): void {
   }
 }
 
-const receiverMachine = new ReceiverMachine();
+
+function logGapEvent(event: {
+  type: 'gap_detected' | 'gap_filled' | 'gap_lost';
+  streamId: string;
+  expectedSeq: number;
+  receivedSeq: number;
+  gapSize: number;
+  permanentlyLost: boolean;
+}): void {
+  console.info('[receiver.gap]', {
+    streamId: event.streamId,
+    expectedSeq: event.expectedSeq,
+    receivedSeq: event.receivedSeq,
+    gapSize: event.gapSize,
+    event: event.type,
+    status: event.permanentlyLost ? 'permanently_lost' : event.type === 'gap_filled' ? 'filled' : 'open'
+  });
+}
+
+const receiverMachine = new ReceiverMachine({ onGapEvent: logGapEvent });
 const receiverIngest = new ReceiverIngestService({
   machine: receiverMachine,
   onEvent: (event) => {

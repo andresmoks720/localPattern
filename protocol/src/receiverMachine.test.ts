@@ -89,6 +89,95 @@ describe('receiver machine', () => {
     expect(snapshot.fileBytes).toEqual(new Uint8Array([1, 2, 3, 4]));
   });
 
+
+
+  it('tracks last contiguous packet and missing ranges while waiting for out-of-order packets', () => {
+    const machine = new ReceiverMachine();
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4, 5, 6]), { fileName: 'gaps.bin', maxPayloadSize: 2, includeEndFrame: true });
+    machine.startScanning();
+    confirmHeaderLock(machine, transfer.header, 1);
+
+    const afterPacket2 = machine.applyFrame(transfer.dataFrames[2], 10);
+    expect(afterPacket2.lastContiguousPacketIndex).toBe(-1);
+    expect(afterPacket2.missingRanges).toEqual([{ start: 0, end: 1 }]);
+
+    const afterPacket0 = machine.applyFrame(transfer.dataFrames[0], 11);
+    expect(afterPacket0.lastContiguousPacketIndex).toBe(0);
+    expect(afterPacket0.missingRanges).toEqual([{ start: 1, end: 1 }]);
+
+    const afterPacket1 = machine.applyFrame(transfer.dataFrames[1], 12);
+    expect(afterPacket1.lastContiguousPacketIndex).toBe(2);
+    expect(afterPacket1.missingRanges).toEqual([]);
+    expect(afterPacket1.state).toBe('SUCCESS');
+  });
+
+  it('emits structured gap lifecycle events including permanently-lost timeout outcomes', () => {
+    const gapEvents: Array<{
+      type: string;
+      expectedSeq: number;
+      receivedSeq: number;
+      gapSize: number;
+      permanentlyLost: boolean;
+      retransmitRequested: boolean;
+      streamId: string;
+    }> = [];
+    const machine = new ReceiverMachine({
+      onGapEvent: (event) => {
+        gapEvents.push({
+          type: event.type,
+          expectedSeq: event.expectedSeq,
+          receivedSeq: event.receivedSeq,
+          gapSize: event.gapSize,
+          permanentlyLost: event.permanentlyLost,
+          retransmitRequested: event.retransmitRequested,
+          streamId: event.streamId
+        });
+      }
+    });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4, 5, 6]), { fileName: 'gaps-events.bin', maxPayloadSize: 2, includeEndFrame: true });
+    machine.startScanning();
+    confirmHeaderLock(machine, transfer.header, 1);
+
+    machine.applyFrame(transfer.dataFrames[2], 10); // detect 0-1 gap
+    machine.applyFrame(transfer.dataFrames[0], 11); // fill 0, leave 1
+    machine.applyFrame(transfer.endFrame!, 12);
+    machine.tick(12 + RECEIVER_TIMEOUTS.END_GRACE_MS + 1);
+
+    expect(gapEvents[0]).toMatchObject({
+      type: 'gap_detected',
+      expectedSeq: 0,
+      receivedSeq: 2,
+      gapSize: 2,
+      permanentlyLost: false,
+      retransmitRequested: false
+    });
+    expect(gapEvents[1]).toMatchObject({
+      type: 'gap_filled',
+      expectedSeq: 0,
+      receivedSeq: 0,
+      gapSize: 2,
+      permanentlyLost: false,
+      retransmitRequested: false
+    });
+    expect(gapEvents[2]).toMatchObject({
+      type: 'gap_detected',
+      expectedSeq: 1,
+      receivedSeq: 0,
+      gapSize: 1,
+      permanentlyLost: false,
+      retransmitRequested: false
+    });
+    expect(gapEvents[3]).toMatchObject({
+      type: 'gap_lost',
+      expectedSeq: 1,
+      gapSize: 1,
+      permanentlyLost: true,
+      retransmitRequested: false
+    });
+    expect(gapEvents.every((event) => event.streamId === machine.snapshot.transferId)).toBe(true);
+  });
+
   it('ignores END from wrong transferId', () => {
     const machine = new ReceiverMachine();
     const transferA = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
