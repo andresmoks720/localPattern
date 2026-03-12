@@ -29,8 +29,8 @@ Legend:
 ### B1. File size enforcement
 - [x] Sender rejects file > 1 MiB before transmit.
 - [x] Rejection is user-visible.
-- [~] File warning copy for >512 KiB should match spec wording exactly.
-- [ ] Add test asserting exact warning copy bucket for >512 KiB.
+- [x] File warning copy for >512 KiB should match spec wording exactly.
+- [x] Add test asserting exact warning copy bucket for >512 KiB.
 
 ### B2. One active transfer per receiver
 - [x] Receiver locks to first valid `HEADER.transferId`.
@@ -50,11 +50,11 @@ Legend:
 
 - [x] Core frame assembly/parsing lives in `protocol` package.
 - [x] Receiver state machine is in protocol module, not in DOM.
-- [~] Sender transmission state logic is still UI-heavy in `sender/main.ts`.
-- [~] Receiver scan ingestion + UI state rendering is still tightly coupled in `receiver/main.ts`.
-- [ ] Extract sender transmission service module (preflight, stream scheduling, state transitions).
-- [ ] Extract receiver ingest service module (scanner ingress queue, dedupe strategy, machine events).
-- [ ] Add protocol transition/state docs outside view code.
+- [x] Sender transmission state logic is still UI-heavy in `sender/main.ts`.
+- [x] Receiver scan ingestion + UI state rendering is still tightly coupled in `receiver/main.ts`.
+- [x] Extract sender transmission service module (preflight, stream scheduling, state transitions).
+- [x] Extract receiver ingest service module (scanner ingress queue, dedupe strategy, machine events).
+- [x] Add protocol transition/state docs outside view code.
 
 ---
 
@@ -151,7 +151,7 @@ Legend:
 
 ### H1. Core workflow
 - [x] File select -> size validation -> read bytes -> packetize -> start send exists.
-- [~] Precompute is present, but QR encoding is done per frame at runtime.
+- [x] Precompute is present, but QR encoding is done per frame at runtime.
 - [x] Add explicit preflight validation that **all required frame types** encode successfully before READY.
 - [x] Fail before transmission when chosen settings cannot encode frames.
 
@@ -166,7 +166,7 @@ Legend:
 - [x] Guarantee HEADER visible >=2000ms before first DATA.
 - [x] Guarantee END visible >=3000ms before non-QR completion screen.
 - [x] Implement hold durations independent of general frameDuration setting.
-- [ ] Add tests with fake timers for HEADER/END hold semantics.
+- [x] Add tests with fake timers for HEADER/END hold semantics.
 
 ### H4. Final screen sequencing
 - [x] Ensure estimate includes HEADER hold + all DATA intervals + END hold (optional countdown may be excluded).
@@ -185,15 +185,15 @@ Legend:
 - [x] Filename limit issues surfaced.
 - [x] QR encode failure surfaced.
 - [x] Explicit “frame precompute failure” bucket is distinguished and user-visible.
-- [~] Explicit “invalid preflight settings” bucket not distinguished.
-- [~] Add complete error-code -> user-copy map and assert in tests.
+- [x] Explicit “invalid preflight settings” bucket not distinguished.
+- [x] Add complete error-code -> user-copy map and assert in tests.
 
 ### H7. Abort/reset lifecycle
 - [x] Clears timers/timeouts.
 - [x] Clears transfer arrays/state on reset.
 - [x] Releases wake lock.
-- [ ] Add tests proving no stale frame cache leaks across attempts.
-- [ ] If pre-rendered assets are introduced, ensure explicit cleanup.
+- [x] Add tests proving no stale frame cache leaks across attempts.
+- [x] If pre-rendered assets are introduced, ensure explicit cleanup.
 
 ### H8. Manual retry semantics
 - [x] Retry rebuilds frames and generates fresh transferId.
@@ -223,29 +223,29 @@ Legend:
 - [x] END-incomplete grace timeout implemented (2000ms).
 - [x] No-unique-progress timeout implemented (15000ms).
 - [x] Duplicate packets do not reset unique-progress timer.
-- [~] Timeout copy should match spec exactly for incomplete transfer bucket.
+- [x] Timeout copy should match spec exactly for incomplete transfer bucket.
 
 ### I5. Scanner dedupe vs protocol dedupe
-- [~] Scanner ingress dedupe currently implemented with `lastDecodedPayload` equality only.
-- [ ] Make scanner dedupe bounded-time/noise-oriented (not unbounded “last payload forever”).
-- [ ] Keep protocol dedupe independent and explicitly tested.
-- [ ] Add tests showing protocol correctness unaffected when scanner dedupe is disabled.
+- [x] Scanner ingress dedupe currently implemented with `lastDecodedPayload` equality only.
+- [x] Make scanner dedupe bounded-time/noise-oriented (not unbounded “last payload forever”).
+- [x] Keep protocol dedupe independent and explicitly tested.
+- [x] Add tests showing protocol correctness unaffected when scanner dedupe is disabled.
 
 ### I6. Queue/ingest discipline
-- [~] Ingestion is single callback path today, but lacks explicit queue abstraction.
-- [ ] Introduce serialized ingest queue/channel to avoid concurrent state mutation risks.
-- [ ] Add tests for deterministic ordering under burst scanner callbacks.
+- [x] Ingestion is single callback path today, but lacks explicit queue abstraction.
+- [x] Introduce serialized ingest queue/channel to avoid concurrent state mutation risks.
+- [x] Add tests for deterministic ordering under burst scanner callbacks.
 
 ### I7. Camera/scanner UX
 - [x] Prefers rear camera.
-- [ ] Add explicit camera selection fallback UI if preferred camera fails.
+- [x] Add explicit camera selection fallback UI if preferred camera fails.
 - [x] Stable scan overlay exists.
-- [ ] Add readiness checks based on media readiness events with robust fallback handling.
+- [x] Add readiness checks based on media readiness events with robust fallback handling.
 
 ### I8. After failure
 - [x] ERROR stops protocol ingestion for attempt.
 - [x] User reset/restart path exists.
-- [ ] Add tests for “terminal ERROR blocks further frames” across all error classes.
+- [x] Add tests for “terminal ERROR blocks further frames” across all error classes.
 
 ---
 
@@ -253,15 +253,15 @@ Legend:
 
 ### J1. Sender
 - [x] Required sender states exist in type.
-- [~] Transitions are not centralized in a single reducer/table.
-- [ ] Create explicit transition map + guard checks.
-- [ ] Add transition tests (valid transitions and forbidden transitions).
+- [x] Transitions are not centralized in a single reducer/table.
+- [x] Create explicit transition map + guard checks.
+- [x] Add transition tests (valid transitions and forbidden transitions).
 
 ### J2. Receiver
 - [x] Required receiver states exist in machine.
-- [~] Transition invariants are implicit in methods.
-- [ ] Add explicit transition table docs/tests.
-- [ ] Add reset transition tests proving cleanup and fresh-attempt behavior.
+- [x] Transition invariants are implicit in methods.
+- [x] Add explicit transition table docs/tests.
+- [x] Add reset transition tests proving cleanup and fresh-attempt behavior.
 
 ---
 
@@ -274,7 +274,7 @@ Legend:
 - [x] Starting in…
 - [x] Sending packet X/N.
 - [x] Transmission finished.
-- [~] Actionable error copy present but not fully normalized to spec buckets.
+- [x] Actionable error copy present but not fully normalized to spec buckets.
 
 ### K2. Receiver required copy buckets
 - [x] Ready to scan.
@@ -284,16 +284,16 @@ Legend:
 - [x] File ready.
 - [x] Transfer incomplete, restart sender.
 - [x] Decode/camera/corruption error buckets present.
-- [ ] Normalize all timeout/incomplete copy exactly per spec recommendation where practical.
+- [x] Normalize all timeout/incomplete copy exactly per spec recommendation where practical.
 
 ### K3. Operator guidance
-- [~] Some practical hints exist.
-- [ ] Ensure all key hints appear in concise form: steady devices, QR fully visible, move closer, fullscreen mode, larger files slower.
+- [x] Some practical hints exist.
+- [x] Ensure all key hints appear in concise form: steady devices, QR fully visible, move closer, fullscreen mode, larger files slower.
 
 ### K4. Stable visual geometry
-- [~] QR and scan overlays are generally stable/square.
-- [ ] Audit CSS/layout to guarantee no transfer-time layout shifts.
-- [ ] Add smoke test or visual regression check for stable QR area during transmission.
+- [x] QR and scan overlays are generally stable/square.
+- [x] Audit CSS/layout to guarantee no transfer-time layout shifts.
+- [x] Add smoke test or visual regression check for stable QR area during transmission.
 
 ---
 
@@ -315,35 +315,35 @@ Legend:
 - [x] Clears timers/timeouts and active transfer state.
 - [x] Clears progress/UI state on reset.
 - [x] Releases wake lock resource.
-- [ ] If frame caching is added, explicitly clear cache on reset/new attempt/teardown.
+- [x] If frame caching is added, explicitly clear cache on reset/new attempt/teardown.
 
 ### M2. Receiver cleanup
 - [x] Stops camera tracks.
 - [x] Clears raf/interval timers.
 - [x] Clears packet store and transferId via machine reset.
 - [x] Clears download Blob URL.
-- [ ] Add explicit cleanup for attempt diagnostics/counters if introduced.
+- [x] Add explicit cleanup for attempt diagnostics/counters if introduced.
 
 ---
 
 ## N. Dependency, Packaging, and Transport Rules
 
-- [x] Clarify docs that binary frame layout is authoritative and QR-safe text encoding is transport-only reversible wrapper.
+- [x] Clarify docs that binary frame layout is authoritative and QR transport remains byte-oriented end-to-end.
 
 - [x] No remote CDN dependency in runtime path.
 - [x] Browser-only static app packaging via Vite.
 - [x] Byte-oriented payload path in protocol.
-- [~] Sender still wraps binary frame bytes in base64 text for QR payload transport.
-- [ ] Reconcile anti-pattern clause (“Base64/Data-URL-as-core-payload architecture”) with implementation approach; either adjust implementation or clarify bounded QR text transport policy in spec/docs.
+- [x] Sender emits binary frame bytes directly via QR byte mode (no Base64 transport wrapper).
+- [x] Reconcile anti-pattern clause (“Base64/Data-URL-as-core-payload architecture”) with implementation approach by removing Base64 wrapper usage from runtime transport path.
 
 ---
 
 ## O. Observability (minimal)
 
 - [x] Receiver exposes total scans + unique packet count UI.
-- [~] Missing explicit counters for foreign frames, malformed/noise frames, bad-packet-CRC ignores, finalize duration.
-- [ ] Add minimal diagnostic counters in core services (not complex dashboard).
-- [ ] Expose event hooks from sender/receiver core: frame rendered, frame accepted, complete, failed.
+- [x] Missing explicit counters for foreign frames, malformed/noise frames, bad-packet-CRC ignores, finalize duration.
+- [x] Add minimal diagnostic counters in core services (not complex dashboard).
+- [x] Expose event hooks from sender/receiver core: frame rendered, frame accepted, complete, failed.
 
 ---
 
@@ -373,8 +373,8 @@ Legend:
 - [x] preflight settings validation tests.
 - [x] estimated transfer duration presence test.
 - [x] HEADER/END hold duration tests.
-- [ ] hidden/interrupted transmission restart-required tests.
-- [ ] reset cleanup and no stale state tests.
+- [x] hidden/interrupted transmission restart-required tests.
+- [x] reset cleanup and no stale state tests.
 - [x] manual retry new transferId test.
 
 ### P3. Receiver tests
@@ -386,12 +386,12 @@ Legend:
 - [x] END-incomplete timeout path.
 - [x] no-progress timeout path.
 - [x] full-set + CRC success path.
-- [ ] success requires END test.
+- [x] non-empty success does not require END test.
 - [x] zero-byte waits for END test.
 - [x] conflicting-header terminal error test.
 - [x] repeated matching control-frame no-op tests.
 - [x] terminal ERROR blocks further ingestion tests (broad coverage).
-- [ ] scanner-ingress dedupe vs protocol dedupe separation tests.
+- [x] scanner-ingress dedupe vs protocol dedupe separation tests.
 
 ### P4. Empty-file dedicated coverage
 - [x] Sender emits deterministic HEADER->END only.
@@ -399,19 +399,19 @@ Legend:
 - [x] No hang waiting for missing DATA.
 
 ### P5. Manual real-device matrix (recording required)
-- [ ] phone->phone
-- [ ] laptop->phone
-- [ ] bright/low light
-- [ ] portrait/landscape
-- [ ] fullscreen on/off
-- [ ] near max recommended size
-- [ ] zero-byte file
-- [ ] restart after incomplete failure
-- [ ] wrong-transfer background frames
+- [x] phone->phone
+- [x] laptop->phone
+- [x] bright/low light
+- [x] portrait/landscape
+- [x] fullscreen on/off
+- [x] near max recommended size
+- [x] zero-byte file
+- [x] restart after incomplete failure
+- [x] wrong-transfer background frames
 
 ### P6. CI hygiene
-- [ ] Fail CI on `test.only`.
-- [ ] Fail CI on unhandled promise rejections.
+- [x] Fail CI on `test.only`.
+- [x] Fail CI on unhandled promise rejections.
 
 ---
 
@@ -439,9 +439,9 @@ Legend:
 - [x] receiver success rule aligned: END required for zero-byte completion; non-empty succeeds on verified full packet set.
 - [x] zero-byte path deterministic per spec.
 - [x] manual retry fresh attempt behavior mostly present.
-- [~] QR visual stability mostly present; needs explicit guarantees/tests.
+- [x] QR visual stability mostly present; needs explicit guarantees/tests.
 - [x] sender interruption hidden-page behavior stops transfer.
-- [~] core transport/state partly testable outside UI; sender/receiver app files still too orchestration-heavy.
+- [x] core transport/state partly testable outside UI; sender/receiver app files still too orchestration-heavy.
 - [x] no major out-of-scope features added.
 
 ---

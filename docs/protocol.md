@@ -50,6 +50,8 @@ Fields:
 - `READY` -> `ERROR` if packetization/settings/preflight validation fails.
 - `ERROR` -> `NO_FILE` on reset.
 
+See [`docs/state-transitions.md`](./state-transitions.md) for consolidated sender + receiver transition and lock/ignore rules.
+
 ## Integrity/error code map
 Structured protocol errors use machine-readable `code` values.
 

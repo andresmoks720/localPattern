@@ -8,6 +8,15 @@ export const RECEIVER_TIMEOUTS = {
 
 export type ReceiverState = 'IDLE' | 'SCANNING' | 'RECEIVING' | 'VERIFYING' | 'SUCCESS' | 'ERROR';
 
+export const RECEIVER_STATE_TRANSITIONS: Record<ReceiverState, ReceiverState[]> = {
+  IDLE: ['IDLE', 'SCANNING'],
+  SCANNING: ['SCANNING', 'RECEIVING', 'ERROR', 'IDLE'],
+  RECEIVING: ['RECEIVING', 'VERIFYING', 'ERROR', 'IDLE'],
+  VERIFYING: ['VERIFYING', 'SUCCESS', 'ERROR', 'IDLE'],
+  SUCCESS: ['SUCCESS', 'IDLE'],
+  ERROR: ['ERROR', 'IDLE']
+};
+
 export const RECEIVER_ERROR_CODES = {
   END_INCOMPLETE: 'END_INCOMPLETE',
   NO_PROGRESS_TIMEOUT: 'NO_PROGRESS_TIMEOUT',
@@ -61,7 +70,7 @@ export class ReceiverMachine {
 
   public startScanning(): void {
     this.reset();
-    this.snapshotValue.state = 'SCANNING';
+    this.setState('SCANNING');
   }
 
   public reset(): void {
@@ -158,7 +167,7 @@ export class ReceiverMachine {
     this.snapshotValue.totalPackets = frame.totalPackets;
     this.snapshotValue.fileCrc32 = frame.fileCrc32;
     this.snapshotValue.lastUniquePacketAt = this.snapshotValue.lastUniquePacketAt ?? now;
-    this.snapshotValue.state = 'RECEIVING';
+    this.setState('RECEIVING');
   }
 
   private applyData(frame: TransferDataFrame, now: number): void {
@@ -188,7 +197,7 @@ export class ReceiverMachine {
         return this.snapshot;
       }
 
-      this.snapshotValue.state = 'VERIFYING';
+      this.setState('VERIFYING');
       const fileBytes = new Uint8Array();
 
       if (calculateCRC32(fileBytes) !== this.snapshotValue.fileCrc32) {
@@ -199,7 +208,7 @@ export class ReceiverMachine {
         return this.fail(RECEIVER_ERROR_CODES.FILE_SIZE_MISMATCH, 'File size mismatch detected during verification.');
       }
 
-      this.snapshotValue.state = 'SUCCESS';
+      this.setState('SUCCESS');
       this.snapshotValue.fileBytes = fileBytes;
       return this.snapshot;
     }
@@ -239,8 +248,17 @@ export class ReceiverMachine {
     return this.snapshot;
   }
 
+
+  private setState(next: ReceiverState): void {
+    const allowed = RECEIVER_STATE_TRANSITIONS[this.snapshotValue.state];
+    if (!allowed.includes(next)) {
+      throw new Error(`Invalid receiver transition: ${this.snapshotValue.state} -> ${next}`);
+    }
+    this.snapshotValue.state = next;
+  }
+
   private fail(code: ReceiverErrorCode, message: string): ReceiverSnapshot {
-    this.snapshotValue.state = 'ERROR';
+    this.setState('ERROR');
     this.snapshotValue.error = { code, message };
     return this.snapshot;
   }

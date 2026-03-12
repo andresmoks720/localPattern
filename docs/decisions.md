@@ -5,18 +5,17 @@
 ### Sender: `qrcode`
 - Chosen because it is lightweight, stable, and works cleanly with Vite bundling.
 - Supports explicit error correction settings and canvas rendering.
-- We encode packet bytes as Base64 text with a short prefix (`QDB64:`) to avoid byte-mode compatibility issues across scanner implementations.
+- We encode protocol frames as QR byte-mode segments so scanned payloads map directly back to authoritative frame bytes.
 
 ### Receiver: `jsqr`
 - Chosen because it decodes from raw frame pixel data (`ImageData`) captured from `getUserMedia` video streams.
 - It has no network/runtime CDN dependency and bundles locally in the app build.
 
 ## Encoding Strategy
-- Packet binary is created via `assemblePacket(packet): Uint8Array` from the shared protocol package.
-- Sender converts packet bytes to Base64 string (`QDB64:<base64>`) before QR generation.
-- Receiver validates the prefix, decodes Base64 back to `Uint8Array`, then runs `parsePacket(...)` to verify magic/version/checksum.
-- Each packet repeats transfer metadata (`totalPackets`, `fileName`, `fullFileHash`) to support late-join scanning and deterministic completion checks.
-- This preserves binary integrity for arbitrary file types and avoids UTF-8 corruption risks.
+- Frame binary is created via `assembleFrame(frame): Uint8Array` from the shared protocol package (authoritative wire contract).
+- Sender renders `assembleFrame(frame)` bytes directly as a QR byte-mode segment.
+- Receiver reads `jsQR` `binaryData` bytes and runs `parseFrame(...)` directly for protocol validation.
+- This keeps transport and protocol byte-oriented end-to-end for arbitrary binary file types without a text wrapper.
 
 ## Reliability Defaults
 - QR size is settings-driven via the sender slider (`200-600px`), with a default of `400px`; rendering forces high-contrast black-on-white colors (`#000000` on `#FFFFFF`) for decoder reliability.

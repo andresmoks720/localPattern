@@ -14,7 +14,9 @@
     "typecheck": "npm run typecheck --workspaces",
     "size:check": "npm run build --workspaces",
     "build:all": "npm run build -w protocol && npm run build -w sender && npm run build -w receiver",
-    "build:pages": "npm run build:all && node scripts/build-pages.mjs"
+    "build:pages": "npm run build:all && node scripts/build-pages.mjs",
+    "ci:check-focused-tests": "node scripts/ci-hygiene.mjs",
+    "ci:test": "npm run ci:check-focused-tests && NODE_OPTIONS=--unhandled-rejections=strict npm run test -w protocol && NODE_OPTIONS=--unhandled-rejections=strict npm run test -w sender && NODE_OPTIONS=--unhandled-rejections=strict npm run test -w receiver"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.6",
