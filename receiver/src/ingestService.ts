@@ -1,5 +1,8 @@
 import { MAGIC_BYTES, PROTOCOL_ERROR_CODES, ProtocolError, parseFrame, type ReceiverMachine, type ReceiverSnapshot, type TransferFrame } from '@qr-data-bridge/protocol';
 
+const DEFAULT_SCANNER_DEDUPE_WINDOW_MS = 4000;
+const DEFAULT_MAX_PENDING_INGESTIONS = 64;
+
 export interface ReceiverIngestDiagnostics {
   totalPayloadsSeen: number;
   nonProtocolPayloads: number;
@@ -9,6 +12,7 @@ export interface ReceiverIngestDiagnostics {
   foreignTransferFrames: number;
   acceptedFrames: number;
   finalizeDurationMs: number | null;
+  droppedQueuedPayloads: number;
 }
 
 export type ReceiverIngestEvent =
@@ -19,8 +23,37 @@ export type ReceiverIngestEvent =
   | { type: 'badPacketCrcIgnored' }
   | { type: 'completed'; durationMs: number };
 
+interface PendingIngestion {
+  rawPayload: Uint8Array;
+  now: number;
+}
+
+interface ScannerKeyEntry {
+  key: string;
+  seenAt: number;
+}
+
+function transferIdToHex(transferId: Uint8Array): string {
+  let hex = '';
+  for (let i = 0; i < transferId.length; i += 1) {
+    hex += transferId[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function scannerPayloadKey(rawPayload: Uint8Array): string {
+  let hash = 2166136261;
+  for (let i = 0; i < rawPayload.length; i += 1) {
+    hash ^= rawPayload[i];
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${rawPayload.length}:${hash >>> 0}`;
+}
+
 export class ReceiverIngestService {
   private readonly recentPayloads = new Map<string, number>();
+
+  private readonly recentPayloadOrder: ScannerKeyEntry[] = [];
 
   private firstAcceptedAt: number | null = null;
 
@@ -32,23 +65,27 @@ export class ReceiverIngestService {
     badPacketCrcFrames: 0,
     foreignTransferFrames: 0,
     acceptedFrames: 0,
-    finalizeDurationMs: null
+    finalizeDurationMs: null,
+    droppedQueuedPayloads: 0
   };
 
   private ingestionChain: Promise<ReceiverSnapshot | null> = Promise.resolve(null);
 
-  private readonly pendingIngestions: Array<{ rawPayload: Uint8Array; now: number }> = [];
+  private readonly pendingIngestions: PendingIngestion[] = [];
+
   constructor(
     private readonly deps: {
       machine: ReceiverMachine;
       onEvent?: (event: ReceiverIngestEvent) => void;
       scannerDedupeEnabled?: boolean;
       scannerDedupeWindowMs?: number;
+      maxPendingIngestions?: number;
     }
   ) {}
 
   public reset(): void {
     this.recentPayloads.clear();
+    this.recentPayloadOrder.length = 0;
     this.firstAcceptedAt = null;
     this.pendingIngestions.length = 0;
     this.ingestionChain = Promise.resolve(null);
@@ -60,7 +97,8 @@ export class ReceiverIngestService {
       badPacketCrcFrames: 0,
       foreignTransferFrames: 0,
       acceptedFrames: 0,
-      finalizeDurationMs: null
+      finalizeDurationMs: null,
+      droppedQueuedPayloads: 0
     };
   }
 
@@ -69,7 +107,13 @@ export class ReceiverIngestService {
   }
 
   public enqueue(rawPayload: Uint8Array, now: number): Promise<ReceiverSnapshot | null> {
+    const maxPendingIngestions = this.deps.maxPendingIngestions ?? DEFAULT_MAX_PENDING_INGESTIONS;
+    if (this.pendingIngestions.length >= maxPendingIngestions) {
+      this.pendingIngestions.shift();
+      this.diagnosticsValue.droppedQueuedPayloads += 1;
+    }
     this.pendingIngestions.push({ rawPayload, now });
+
     this.ingestionChain = this.ingestionChain.then(async () => {
       const next = this.pendingIngestions.shift();
       if (!next) return null;
@@ -91,15 +135,16 @@ export class ReceiverIngestService {
     }
 
     this.pruneDedupeWindow(now);
-    const dedupeKey = this.toPayloadKey(rawPayload);
     if (this.deps.scannerDedupeEnabled ?? true) {
+      const dedupeKey = scannerPayloadKey(rawPayload);
       const seenAt = this.recentPayloads.get(dedupeKey);
-      if (seenAt !== undefined && now - seenAt <= (this.deps.scannerDedupeWindowMs ?? 4000)) {
+      if (seenAt !== undefined && now - seenAt <= (this.deps.scannerDedupeWindowMs ?? DEFAULT_SCANNER_DEDUPE_WINDOW_MS)) {
         this.diagnosticsValue.duplicateScannerPayloads += 1;
         this.deps.onEvent?.({ type: 'duplicateScannerPayload' });
         return null;
       }
       this.recentPayloads.set(dedupeKey, now);
+      this.recentPayloadOrder.push({ key: dedupeKey, seenAt: now });
     }
 
     try {
@@ -107,10 +152,7 @@ export class ReceiverIngestService {
       const before = this.deps.machine.snapshot;
       const snapshot = this.deps.machine.applyFrame(frame, now);
 
-      if (
-        before.transferId
-        && Array.from(frame.transferId).map((value) => value.toString(16).padStart(2, '0')).join('') !== before.transferId
-      ) {
+      if (before.transferId && transferIdToHex(frame.transferId) !== before.transferId) {
         this.diagnosticsValue.foreignTransferFrames += 1;
         this.deps.onEvent?.({ type: 'foreignFrameIgnored' });
       }
@@ -142,15 +184,15 @@ export class ReceiverIngestService {
     return rawPayload.length > 5 && MAGIC_BYTES.every((byte, index) => rawPayload[index] === byte);
   }
 
-  private toPayloadKey(rawPayload: Uint8Array): string {
-    return Array.from(rawPayload).map((value) => value.toString(16).padStart(2, '0')).join('');
-  }
-
   private pruneDedupeWindow(now: number): void {
-    const windowMs = this.deps.scannerDedupeWindowMs ?? 4000;
-    for (const [payload, seenAt] of this.recentPayloads) {
-      if (now - seenAt > windowMs) {
-        this.recentPayloads.delete(payload);
+    const windowMs = this.deps.scannerDedupeWindowMs ?? DEFAULT_SCANNER_DEDUPE_WINDOW_MS;
+    while (this.recentPayloadOrder.length > 0) {
+      const first = this.recentPayloadOrder[0];
+      if (now - first.seenAt <= windowMs) break;
+      this.recentPayloadOrder.shift();
+      const currentSeenAt = this.recentPayloads.get(first.key);
+      if (currentSeenAt === first.seenAt) {
+        this.recentPayloads.delete(first.key);
       }
     }
   }

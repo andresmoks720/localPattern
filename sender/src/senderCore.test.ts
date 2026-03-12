@@ -11,7 +11,7 @@ import {
   getTransmissionWarnings,
   HEADER_HOLD_MS,
   END_HOLD_MS,
-  FIXED_DATA_FRAME_DURATION_MS,
+  DEFAULT_DATA_FRAME_DURATION_MS,
   preflightBuildFrameDataUrls,
   preflightEncodeFrames,
   readFileBytes,
@@ -157,13 +157,15 @@ describe('sender core', () => {
     expect(Array.from(firstHeader.transferId)).not.toEqual(Array.from(secondHeader.transferId));
   });
 
-  it('uses fixed frame durations with control-frame holds', () => {
+  it('uses frame durations with configurable data-frame timing and control-frame holds', () => {
     const { frames } = buildTransmissionFrames(new Uint8Array([1, 2, 3, 4]), 'dur.bin', 2);
     expect(getFrameDisplayDurationMs(frames[0])).toBe(HEADER_HOLD_MS);
-    expect(getFrameDisplayDurationMs(frames[1])).toBe(FIXED_DATA_FRAME_DURATION_MS);
-    expect(getFrameDisplayDurationMs(frames[2])).toBe(FIXED_DATA_FRAME_DURATION_MS);
+    expect(getFrameDisplayDurationMs(frames[1])).toBe(DEFAULT_DATA_FRAME_DURATION_MS);
+    expect(getFrameDisplayDurationMs(frames[2])).toBe(DEFAULT_DATA_FRAME_DURATION_MS);
+    expect(getFrameDisplayDurationMs(frames[1], 900)).toBe(900);
     expect(getFrameDisplayDurationMs(frames[3])).toBe(END_HOLD_MS);
-    expect(estimateTransmissionDurationMs(frames)).toBe(HEADER_HOLD_MS + FIXED_DATA_FRAME_DURATION_MS + FIXED_DATA_FRAME_DURATION_MS + END_HOLD_MS);
+    expect(estimateTransmissionDurationMs(frames)).toBe(HEADER_HOLD_MS + DEFAULT_DATA_FRAME_DURATION_MS + DEFAULT_DATA_FRAME_DURATION_MS + END_HOLD_MS);
+    expect(estimateTransmissionDurationMs(frames, 900)).toBe(HEADER_HOLD_MS + 900 + 900 + END_HOLD_MS);
   });
 
   it('maps overlong filename to filename limit sender error bucket', () => {

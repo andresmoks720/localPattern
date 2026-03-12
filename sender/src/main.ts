@@ -1,14 +1,18 @@
 import './style.css';
 import QRCode from 'qrcode';
-import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferFrame } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER } from '@qr-data-bridge/protocol';
 import {
   getTransmissionWarnings,
-  buildTransmissionFrames,
-  encodeFrameToCanvas,
+  createTransmissionPlan,
+  encodeFrameBytesToCanvas,
   estimateTransmissionDurationMs,
-  FIXED_DATA_FRAME_DURATION_MS,
+  DEFAULT_DATA_FRAME_DURATION_MS,
   getFrameDisplayDurationMs,
-  preflightBuildFrameDataUrls,
+  getDataFrameBytes,
+  getStreamFrameAtIndex,
+  getTotalScans,
+  preflightTransmissionPlan,
+  type SenderTransmissionPlan,
   readFileBytes,
   SENDER_ERROR_COPY_MAP,
   toUserFacingPreflightError,
@@ -45,7 +49,7 @@ interface SenderSettings {
 }
 
 const DEFAULT_SETTINGS: SenderSettings = {
-  frameDurationMs: FIXED_DATA_FRAME_DURATION_MS,
+  frameDurationMs: DEFAULT_DATA_FRAME_DURATION_MS,
   qrErrorCorrection: 'H',
   qrSizePx: 400,
   chunkSizeBytes: 512,
@@ -84,7 +88,7 @@ function readSettings(): SenderSettings {
   try {
     const parsed = JSON.parse(raw) as Partial<SenderSettings>;
     return {
-      frameDurationMs: FIXED_DATA_FRAME_DURATION_MS,
+      frameDurationMs: clamp(parsed.frameDurationMs ?? DEFAULT_SETTINGS.frameDurationMs, 500, 5000),
       qrErrorCorrection: parsed.qrErrorCorrection ?? DEFAULT_SETTINGS.qrErrorCorrection,
       qrSizePx: clamp(parsed.qrSizePx ?? DEFAULT_SETTINGS.qrSizePx, 200, 600),
       chunkSizeBytes: clamp(parsed.chunkSizeBytes ?? DEFAULT_SETTINGS.chunkSizeBytes, 128, 1024),
@@ -174,7 +178,6 @@ app.innerHTML = `
     <div id="countdown-meta"></div>
     <div id="wake-lock-warning" class="warning"></div>
     <div id="warning-meta" class="warning"></div>
-    <small>Keep QR fully visible, hold devices steady, move closer if scans fail, use fullscreen on receiver, and expect larger files to take longer.</small>
   </aside>
 </main>`;
 
@@ -206,14 +209,12 @@ const soundEnabledInput = getElement<HTMLInputElement>('#sound-enabled');
 const themeButton = getElement<HTMLButtonElement>('#theme-btn');
 
 let settings = readSettings();
-let transmissionFrames: TransferFrame[] = [];
-let streamFrames: TransferFrame[] = [];
 let fileBytes: Uint8Array | null = null;
 let selectedFileName = '';
 let wakeLock: WakeLockSentinel | null = null;
 let senderStage: SenderStage = 'NO_FILE';
 let totalDataPackets = 0;
-let frameDataUrlCache: string[] = [];
+let transmissionPlan: SenderTransmissionPlan | null = null;
 
 
 function setSenderStage(stage: SenderStage, message?: string): void {
@@ -231,21 +232,26 @@ function effectiveChunkSize(): number {
   return settings.chunkAuto ? estimateAutoChunkSize(settings.qrSizePx, settings.qrErrorCorrection) : settings.chunkSizeBytes;
 }
 
+
+function totalScans(): number {
+  return getTotalScans(totalDataPackets, settings.redundancyCount);
+}
+
 function estimatedSpeedBytesPerSec(): number {
   return Math.floor((effectiveChunkSize() / settings.redundancyCount) * (1000 / settings.frameDurationMs));
 }
 
-function frameLabel(frame: TransferFrame): string {
-  if (frame.frameType === FRAME_TYPE_HEADER) return 'HEADER';
-  if (frame.frameType === FRAME_TYPE_END) return 'END';
-  return `packet ${frame.packetIndex + 1}/${totalDataPackets}`;
+function streamFrameLabel(frameType: number, packetIndex?: number): string {
+  if (frameType === FRAME_TYPE_HEADER) return 'HEADER';
+  if (frameType === FRAME_TYPE_END) return 'END';
+  return `packet ${(packetIndex ?? 0) + 1}/${totalDataPackets}`;
 }
 
 function refreshEstimates(): void {
   const speed = estimatedSpeedBytesPerSec();
   speedMeta.textContent = `Estimated Speed: ${speed} B/s`;
   if (fileBytes) {
-    const estimatedMs = estimateTransmissionDurationMs(streamFrames);
+    const estimatedMs = estimateTransmissionDurationMs(totalDataPackets, settings.redundancyCount, settings.frameDurationMs);
     etaMeta.textContent = `Estimated Time: ${formatDuration(estimatedMs)}`;
     warningMeta.textContent = getTransmissionWarnings(fileBytes.length, estimatedMs).join(' ');
   } else {
@@ -255,10 +261,9 @@ function refreshEstimates(): void {
 }
 
 function updateSettingsUi(): void {
-  settings.frameDurationMs = FIXED_DATA_FRAME_DURATION_MS;
-  frameDurationInput.value = String(FIXED_DATA_FRAME_DURATION_MS);
-  frameDurationInput.disabled = true;
-  frameDurationLabel.textContent = `${FIXED_DATA_FRAME_DURATION_MS}ms (fixed MVPv2)`;
+  frameDurationInput.value = String(settings.frameDurationMs);
+  frameDurationInput.disabled = false;
+  frameDurationLabel.textContent = `${settings.frameDurationMs}ms`;
   errorCorrectionSelect.value = settings.qrErrorCorrection;
   qrSizeInput.value = String(settings.qrSizePx);
   qrSizeLabel.textContent = `${settings.qrSizePx}px`;
@@ -274,40 +279,28 @@ function updateSettingsUi(): void {
   qrShell.style.setProperty('--qr-size', `${settings.qrSizePx}px`);
 }
 
-function rebuildFrames(): void {
+function rebuildPlan(): void {
   if (!fileBytes) return;
-  const transmission = buildTransmissionFrames(fileBytes, selectedFileName, effectiveChunkSize());
-  transmissionFrames = transmission.frames;
-  totalDataPackets = transmission.totalDataPackets;
-  const nextStreamFrames: TransferFrame[] = [];
-  for (const frame of transmissionFrames) {
-    if (frame.frameType === FRAME_TYPE_DATA) {
-      for (let i = 0; i < settings.redundancyCount; i += 1) nextStreamFrames.push(frame);
-    } else {
-      nextStreamFrames.push(frame);
-    }
-  }
-  streamFrames = nextStreamFrames;
-  fileMeta.textContent = `${selectedFileName} • ${fileBytes.length} bytes • ${totalDataPackets} packets • ${streamFrames.length} total scans`;
+  const nextPlan = createTransmissionPlan(fileBytes, selectedFileName, effectiveChunkSize());
+  transmissionPlan = nextPlan;
+  totalDataPackets = nextPlan.totalDataPackets;
+  fileMeta.textContent = `${selectedFileName} • ${fileBytes.length} bytes • ${totalDataPackets} packets • ${totalScans()} total scans`;
   refreshEstimates();
-  frameDataUrlCache = [];
 }
 
 function persistAndRefresh(): void {
   saveSettings(settings);
   updateSettingsUi();
   try {
-    rebuildFrames();
-    transmissionService.loadFrames(streamFrames);
+    rebuildPlan();
+    transmissionService.loadTransfer();
   } catch (error) {
-    transmissionFrames = [];
-    streamFrames = [];
+    transmissionPlan = null;
     totalDataPackets = 0;
     const userFacing = toUserFacingSenderError(error);
     setSenderStage('ERROR', userFacing.title);
     warningMeta.textContent = userFacing.warning;
     startButton.disabled = true;
-    frameDataUrlCache = [];
     transmissionService.reset();
   }
 }
@@ -335,39 +328,29 @@ function releaseWakeLock(): void {
   wakeLock = null;
 }
 
-async function renderFrame(index: number, frame: TransferFrame): Promise<void> {
-  const cached = frameDataUrlCache[index];
-  if (cached) {
-    await new Promise<void>((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => {
-        const ctx = qrCanvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error('Failed to initialize QR canvas context.'));
-          return;
-        }
-        ctx.clearRect(0, 0, qrCanvas.width, qrCanvas.height);
-        ctx.drawImage(image, 0, 0, qrCanvas.width, qrCanvas.height);
-        resolve();
-      };
-      image.onerror = () => reject(new Error('Cached frame image failed to load.'));
-      image.src = cached;
-    });
-  } else {
-    await encodeFrameToCanvas(frame, qrCanvas, {
-      qrErrorCorrection: settings.qrErrorCorrection,
-      qrSizePx: settings.qrSizePx
-    });
-  }
+async function renderFrame(index: number, frame: { frameType: number; packetIndex?: number }): Promise<void> {
+  if (!transmissionPlan) throw new Error('Transmission plan unavailable.');
+  let frameBytes: Uint8Array;
+  if (frame.frameType === FRAME_TYPE_HEADER) frameBytes = transmissionPlan.headerBytes;
+  else if (frame.frameType === FRAME_TYPE_END) frameBytes = transmissionPlan.endBytes;
+  else frameBytes = getDataFrameBytes(transmissionPlan, frame.packetIndex ?? 0);
+
+  await encodeFrameBytesToCanvas(frameBytes, qrCanvas, {
+    qrErrorCorrection: settings.qrErrorCorrection,
+    qrSizePx: settings.qrSizePx
+  });
+
   packetMeta.textContent = frame.frameType === FRAME_TYPE_DATA
-    ? `Sending ${frameLabel(frame)}`
-    : `Sending ${frameLabel(frame)} • scan ${index + 1}/${streamFrames.length}`;
+    ? `Sending ${streamFrameLabel(frame.frameType, frame.packetIndex)}`
+    : `Sending ${streamFrameLabel(frame.frameType, frame.packetIndex)} • scan ${index + 1}/${totalScans()}`;
   if (settings.soundEnabled) playClickSound();
   logger.debug('[sender] rendered', { index });
 }
 
 const transmissionService = new SenderTransmissionService({
-  getFrameDisplayDurationMs,
+  getTotalFrames: () => transmissionPlan ? totalScans() : 0,
+  getFrameAt: (index) => transmissionPlan ? getStreamFrameAtIndex(totalDataPackets, settings.redundancyCount, index) : null,
+  getFrameDisplayDurationMs: (frame) => getFrameDisplayDurationMs(frame, settings.frameDurationMs),
   renderFrame,
   requestWakeLock,
   releaseWakeLock,
@@ -382,7 +365,7 @@ const transmissionService = new SenderTransmissionService({
       if (payload.message?.startsWith('Starting in')) countdownMeta.textContent = payload.message;
       setSenderStage(stage, payload.message);
       stopButton.disabled = stage !== 'TRANSMITTING' && stage !== 'COUNTDOWN';
-      startButton.disabled = stage === 'TRANSMITTING' || stage === 'COUNTDOWN' || streamFrames.length === 0;
+      startButton.disabled = stage === 'TRANSMITTING' || stage === 'COUNTDOWN' || !transmissionPlan;
       return;
     }
 
@@ -397,7 +380,7 @@ function stopTransmission(message = 'Transmission stopped.', stage: SenderStage 
 }
 
 frameDurationInput.addEventListener('input', () => {
-  settings.frameDurationMs = FIXED_DATA_FRAME_DURATION_MS;
+  settings.frameDurationMs = clamp(Number(frameDurationInput.value), 500, 5000);
   persistAndRefresh();
 });
 errorCorrectionSelect.addEventListener('change', () => {
@@ -437,8 +420,7 @@ fileInput.addEventListener('change', async () => {
   stopTransmission();
   const selectedFile = fileInput.files?.[0];
   if (!selectedFile) {
-    transmissionFrames = [];
-    streamFrames = [];
+    transmissionPlan = null;
     totalDataPackets = 0;
     fileBytes = null;
     selectedFileName = '';
@@ -446,15 +428,13 @@ fileInput.addEventListener('change', async () => {
     setSenderStage('NO_FILE', 'No file selected');
     startButton.disabled = true;
     refreshEstimates();
-    frameDataUrlCache = [];
     transmissionService.reset();
     return;
   }
 
   const invalidReason = validateFileBeforeTransmission(selectedFile);
   if (invalidReason) {
-    transmissionFrames = [];
-    streamFrames = [];
+    transmissionPlan = null;
     totalDataPackets = 0;
     fileBytes = null;
     selectedFileName = '';
@@ -462,7 +442,6 @@ fileInput.addEventListener('change', async () => {
     setSenderStage('ERROR', invalidReason.title);
     warningMeta.textContent = invalidReason.warning;
     startButton.disabled = true;
-    frameDataUrlCache = [];
     transmissionService.reset();
     return;
   }
@@ -470,8 +449,7 @@ fileInput.addEventListener('change', async () => {
   try {
     fileBytes = await readFileBytes(selectedFile);
   } catch (error) {
-    transmissionFrames = [];
-    streamFrames = [];
+    transmissionPlan = null;
     totalDataPackets = 0;
     fileBytes = null;
     selectedFileName = '';
@@ -479,7 +457,6 @@ fileInput.addEventListener('change', async () => {
     setSenderStage('ERROR', error instanceof Error ? error.message : 'Error: file read failed.');
     warningMeta.textContent = SENDER_ERROR_COPY_MAP.FILE_READ_FAILED.warning;
     startButton.disabled = true;
-    frameDataUrlCache = [];
     transmissionService.reset();
     return;
   }
@@ -487,10 +464,9 @@ fileInput.addEventListener('change', async () => {
   selectedFileName = selectedFile.name;
 
   try {
-    rebuildFrames();
+    rebuildPlan();
   } catch (error) {
-    transmissionFrames = [];
-    streamFrames = [];
+    transmissionPlan = null;
     totalDataPackets = 0;
     fileBytes = null;
     selectedFileName = '';
@@ -499,45 +475,42 @@ fileInput.addEventListener('change', async () => {
     setSenderStage('ERROR', userFacing.title);
     warningMeta.textContent = userFacing.warning;
     startButton.disabled = true;
-    frameDataUrlCache = [];
     transmissionService.reset();
     return;
   }
 
   try {
-    frameDataUrlCache = await preflightBuildFrameDataUrls(streamFrames, {
+    if (!transmissionPlan) throw new Error('Transmission plan unavailable');
+    await preflightTransmissionPlan(transmissionPlan, {
       qrErrorCorrection: settings.qrErrorCorrection,
       qrSizePx: settings.qrSizePx
     });
   } catch (error) {
-    transmissionFrames = [];
-    streamFrames = [];
+    transmissionPlan = null;
     totalDataPackets = 0;
     const userFacing = toUserFacingPreflightError(error);
     setSenderStage('ERROR', userFacing.title);
     warningMeta.textContent = userFacing.warning;
     startButton.disabled = true;
-    frameDataUrlCache = [];
     transmissionService.reset();
     return;
   }
 
   setSenderStage('READY', 'Ready to transmit');
   startButton.disabled = false;
-  transmissionService.loadFrames(streamFrames);
+  transmissionService.loadTransfer();
 });
 
 startButton.addEventListener('click', () => {
   void resumeAudioContext();
-  if (!streamFrames.length) return;
+  if (!transmissionPlan) return;
   transmissionService.start();
 });
 
 stopButton.addEventListener('click', () => stopTransmission());
 resetButton.addEventListener('click', () => {
   stopTransmission('No file selected', 'NO_FILE');
-  transmissionFrames = [];
-  streamFrames = [];
+  transmissionPlan = null;
   totalDataPackets = 0;
   fileBytes = null;
   selectedFileName = '';
@@ -549,7 +522,6 @@ resetButton.addEventListener('click', () => {
   const ctx = qrCanvas.getContext('2d');
   ctx?.clearRect(0, 0, qrCanvas.width, qrCanvas.height);
   startButton.disabled = true;
-  frameDataUrlCache = [];
   transmissionService.reset();
 });
 

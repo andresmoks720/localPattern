@@ -1,16 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
-import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER, type TransferFrame } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_DATA, FRAME_TYPE_END, FRAME_TYPE_HEADER } from '@qr-data-bridge/protocol';
 import { SENDER_STAGE_TRANSITIONS, SenderTransmissionService } from './transmissionService';
+import type { SenderStreamFrame } from './senderCore';
 
-function frame(frameType: number, packetIndex = 0): TransferFrame {
-  const transferId = new Uint8Array(8);
-  if (frameType === FRAME_TYPE_HEADER) {
-    return { frameType, transferId, fileName: 'f.bin', fileSize: 3, totalPackets: 1, fileCrc32: 0, headerCrc32: 0 };
-  }
-  if (frameType === FRAME_TYPE_END) {
-    return { frameType, transferId };
-  }
-  return { frameType: FRAME_TYPE_DATA, transferId, packetIndex, payloadLen: 1, payload: new Uint8Array([1]), packetCrc32: 0 };
+function frame(frameType: number, packetIndex = 0): SenderStreamFrame {
+  if (frameType === FRAME_TYPE_DATA) return { frameType, packetIndex };
+  return { frameType };
+}
+
+function makeDeps(frames: SenderStreamFrame[]) {
+  return {
+    getTotalFrames: () => frames.length,
+    getFrameAt: (index: number) => frames[index] ?? null
+  };
 }
 
 describe('SenderTransmissionService', () => {
@@ -18,8 +20,10 @@ describe('SenderTransmissionService', () => {
     vi.useFakeTimers();
     const rendered: number[] = [];
     const stages: string[] = [];
+    const frames = [frame(FRAME_TYPE_HEADER), frame(FRAME_TYPE_DATA), frame(FRAME_TYPE_END)];
 
     const service = new SenderTransmissionService({
+      ...makeDeps(frames),
       getFrameDisplayDurationMs: () => 10,
       renderFrame: async (idx) => { rendered.push(idx); },
       requestWakeLock: async () => undefined,
@@ -29,7 +33,7 @@ describe('SenderTransmissionService', () => {
       }
     });
 
-    service.loadFrames([frame(FRAME_TYPE_HEADER), frame(FRAME_TYPE_DATA), frame(FRAME_TYPE_END)]);
+    service.loadTransfer();
     service.start();
 
     await vi.advanceTimersByTimeAsync(3000);
@@ -43,14 +47,16 @@ describe('SenderTransmissionService', () => {
 
   it('reset clears active state and frame diagnostics', async () => {
     vi.useFakeTimers();
+    const frames = [frame(FRAME_TYPE_HEADER), frame(FRAME_TYPE_DATA), frame(FRAME_TYPE_END)];
     const service = new SenderTransmissionService({
+      ...makeDeps(frames),
       getFrameDisplayDurationMs: () => 10,
       renderFrame: async () => undefined,
       requestWakeLock: async () => undefined,
       releaseWakeLock: () => undefined
     });
 
-    service.loadFrames([frame(FRAME_TYPE_HEADER), frame(FRAME_TYPE_DATA), frame(FRAME_TYPE_END)]);
+    service.loadTransfer();
     service.start();
     vi.advanceTimersByTime(4000);
     await vi.runAllTimersAsync();
@@ -65,8 +71,10 @@ describe('SenderTransmissionService', () => {
   it('uses fake timers to validate HEADER/DATA/END hold semantics', async () => {
     vi.useFakeTimers();
     const renderCalls: number[] = [];
+    const frames = [frame(FRAME_TYPE_HEADER), frame(FRAME_TYPE_DATA), frame(FRAME_TYPE_END)];
 
     const service = new SenderTransmissionService({
+      ...makeDeps(frames),
       getFrameDisplayDurationMs: (f) => {
         if (f.frameType === FRAME_TYPE_HEADER) return 2000;
         if (f.frameType === FRAME_TYPE_END) return 3000;
@@ -77,7 +85,7 @@ describe('SenderTransmissionService', () => {
       releaseWakeLock: () => undefined
     });
 
-    service.loadFrames([frame(FRAME_TYPE_HEADER), frame(FRAME_TYPE_DATA), frame(FRAME_TYPE_END)]);
+    service.loadTransfer();
     service.start();
 
     await vi.advanceTimersByTimeAsync(3000);
@@ -96,7 +104,9 @@ describe('SenderTransmissionService', () => {
   });
 
   it('exposes explicit transition map and rejects forbidden transitions', () => {
+    const frames: SenderStreamFrame[] = [];
     const service = new SenderTransmissionService({
+      ...makeDeps(frames),
       getFrameDisplayDurationMs: () => 10,
       renderFrame: async () => undefined,
       requestWakeLock: async () => undefined,
@@ -105,14 +115,14 @@ describe('SenderTransmissionService', () => {
 
     expect(service.getTransitionMap()).toEqual(SENDER_STAGE_TRANSITIONS);
 
-    // start in NO_FILE with no frames loaded -> start is a no-op, stays valid
+    // start in NO_FILE with no transfer loaded -> start is a no-op, stays valid
     service.start();
     expect(service.getStage()).toBe('NO_FILE');
 
     expect(() => (service as unknown as { transition: (stage: string) => void }).transition('TRANSMITTING')).toThrow('Invalid sender transition: NO_FILE -> TRANSMITTING');
 
-    // load frames transitions into READY; then reset returns to NO_FILE
-    service.loadFrames([frame(FRAME_TYPE_HEADER)]);
+    frames.push(frame(FRAME_TYPE_HEADER));
+    service.loadTransfer();
     expect(service.getStage()).toBe('READY');
     service.reset();
     expect(service.getStage()).toBe('NO_FILE');

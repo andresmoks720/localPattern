@@ -3,7 +3,7 @@
 This document tracks runtime state transitions outside of UI files so behavior can be validated without reading DOM orchestration code.
 
 Runtime service modules:
-- `sender/src/transmissionService.ts` (sender countdown/scheduling/state machine + events/diagnostics; consumes precomputed frame image cache from sender app)
+- `sender/src/transmissionService.ts` (sender countdown/scheduling/state machine + events/diagnostics; consumes an on-demand sender frame source (no full-frame image cache))
 - `receiver/src/ingestService.ts` (bounded-time scanner duplicate suppression + serialized ingest queue + parse/apply + events/diagnostics)
 
 ## Sender (one-way, single-attempt stream)
@@ -11,7 +11,7 @@ Runtime service modules:
 States: `NO_FILE` -> `READY` -> `COUNTDOWN` -> `TRANSMITTING` -> `COMPLETE` with failure branch to `ERROR`.
 
 - `NO_FILE` -> `READY`
-  - Valid file selected (<= 1 MiB), file bytes loaded, packetization succeeds, and preflight QR encoding succeeds for every frame.
+  - Valid file selected (<= 1 MiB), file bytes loaded, packetization succeeds, and preflight QR encoding succeeds for control frames plus representative DATA payload checks.
 - `READY` -> `COUNTDOWN`
   - User presses Start.
 - `COUNTDOWN` -> `TRANSMITTING`

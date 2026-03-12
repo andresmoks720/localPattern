@@ -49,7 +49,27 @@ export interface ReceiverSnapshot {
 }
 
 function transferIdToKey(transferId: Uint8Array): string {
-  return Array.from(transferId).map((value) => value.toString(16).padStart(2, '0')).join('');
+  let result = '';
+  for (let i = 0; i < transferId.length; i += 1) {
+    result += transferId[i].toString(16).padStart(2, '0');
+  }
+  return result;
+}
+
+function clearBitset(bitset: Uint8Array): void {
+  bitset.fill(0);
+}
+
+function hasBit(bitset: Uint8Array, index: number): boolean {
+  const byteIndex = index >> 3;
+  const bitMask = 1 << (index & 7);
+  return (bitset[byteIndex] & bitMask) !== 0;
+}
+
+function setBit(bitset: Uint8Array, index: number): void {
+  const byteIndex = index >> 3;
+  const bitMask = 1 << (index & 7);
+  bitset[byteIndex] |= bitMask;
 }
 
 export class ReceiverMachine {
@@ -66,7 +86,11 @@ export class ReceiverMachine {
     endSeenAt: null
   };
 
-  private readonly receivedPackets = new Map<number, Uint8Array>();
+  private packetPayloads: Array<Uint8Array | null> = [];
+
+  private packetSeen = new Uint8Array(0);
+
+  private receivedPacketCount = 0;
 
   public startScanning(): void {
     this.reset();
@@ -86,7 +110,9 @@ export class ReceiverMachine {
       lastUniquePacketAt: null,
       endSeenAt: null
     };
-    this.receivedPackets.clear();
+    this.packetPayloads = [];
+    this.packetSeen = new Uint8Array(0);
+    this.receivedPacketCount = 0;
   }
 
   public get snapshot(): ReceiverSnapshot {
@@ -132,7 +158,7 @@ export class ReceiverMachine {
       this.snapshotValue.transferId
       && this.snapshotValue.endSeenAt !== null
       && this.snapshotValue.totalPackets !== null
-      && this.receivedPackets.size < this.snapshotValue.totalPackets
+      && this.receivedPacketCount < this.snapshotValue.totalPackets
       && now - this.snapshotValue.endSeenAt > RECEIVER_TIMEOUTS.END_GRACE_MS
     ) {
       return this.fail(RECEIVER_ERROR_CODES.END_INCOMPLETE, 'END frame seen before all packets were received.');
@@ -167,6 +193,11 @@ export class ReceiverMachine {
     this.snapshotValue.totalPackets = frame.totalPackets;
     this.snapshotValue.fileCrc32 = frame.fileCrc32;
     this.snapshotValue.lastUniquePacketAt = this.snapshotValue.lastUniquePacketAt ?? now;
+    this.packetPayloads = Array.from({ length: frame.totalPackets }, () => null);
+    this.packetSeen = new Uint8Array(Math.ceil(frame.totalPackets / 8));
+    clearBitset(this.packetSeen);
+    this.receivedPacketCount = 0;
+    this.snapshotValue.receivedCount = 0;
     this.setState('RECEIVING');
   }
 
@@ -174,10 +205,12 @@ export class ReceiverMachine {
     if (!this.snapshotValue.transferId || this.snapshotValue.totalPackets === null) return;
     if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
     if (frame.packetIndex < 0 || frame.packetIndex >= this.snapshotValue.totalPackets) return;
-    if (this.receivedPackets.has(frame.packetIndex)) return;
+    if (hasBit(this.packetSeen, frame.packetIndex)) return;
 
-    this.receivedPackets.set(frame.packetIndex, frame.payload);
-    this.snapshotValue.receivedCount = this.receivedPackets.size;
+    this.packetPayloads[frame.packetIndex] = frame.payload;
+    setBit(this.packetSeen, frame.packetIndex);
+    this.receivedPacketCount += 1;
+    this.snapshotValue.receivedCount = this.receivedPacketCount;
     this.snapshotValue.lastUniquePacketAt = now;
   }
 
@@ -198,7 +231,7 @@ export class ReceiverMachine {
       }
 
       this.setState('VERIFYING');
-      const fileBytes = new Uint8Array();
+      const fileBytes = new Uint8Array(0);
 
       if (calculateCRC32(fileBytes) !== this.snapshotValue.fileCrc32) {
         return this.fail(RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH, 'File CRC32 mismatch detected.');
@@ -213,41 +246,37 @@ export class ReceiverMachine {
       return this.snapshot;
     }
 
-    if (this.receivedPackets.size !== this.snapshotValue.totalPackets) {
+    if (this.receivedPacketCount !== this.snapshotValue.totalPackets) {
       return this.snapshot;
     }
 
     this.snapshotValue.state = 'VERIFYING';
-    const ordered: Uint8Array[] = [];
+
+    const expectedSize = this.snapshotValue.expectedFileSize ?? 0;
+    const fileBytes = new Uint8Array(expectedSize);
+    let offset = 0;
+
     for (let i = 0; i < this.snapshotValue.totalPackets; i += 1) {
-      const packet = this.receivedPackets.get(i);
+      const packet = this.packetPayloads[i];
       if (!packet) {
         return this.fail(RECEIVER_ERROR_CODES.MISSING_PACKET, 'Missing packets detected during verification.');
       }
-      ordered.push(packet);
-    }
-
-    const totalLength = ordered.reduce((sum, packet) => sum + packet.length, 0);
-    const fileBytes = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const packet of ordered) {
       fileBytes.set(packet, offset);
       offset += packet.length;
+    }
+
+    if (offset !== expectedSize) {
+      return this.fail(RECEIVER_ERROR_CODES.FILE_SIZE_MISMATCH, 'File size mismatch detected during verification.');
     }
 
     if (calculateCRC32(fileBytes) !== this.snapshotValue.fileCrc32) {
       return this.fail(RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH, 'File CRC32 mismatch detected.');
     }
 
-    if (this.snapshotValue.expectedFileSize !== null && fileBytes.length !== this.snapshotValue.expectedFileSize) {
-      return this.fail(RECEIVER_ERROR_CODES.FILE_SIZE_MISMATCH, 'File size mismatch detected during verification.');
-    }
-
     this.snapshotValue.state = 'SUCCESS';
     this.snapshotValue.fileBytes = fileBytes;
     return this.snapshot;
   }
-
 
   private setState(next: ReceiverState): void {
     const allowed = RECEIVER_STATE_TRANSITIONS[this.snapshotValue.state];
