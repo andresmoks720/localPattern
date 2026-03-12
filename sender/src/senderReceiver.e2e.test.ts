@@ -1,7 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { RECEIVER_ERROR_CODES, ReceiverMachine, assembleFrame, chunkFile } from '@qr-data-bridge/protocol';
+import { FRAME_TYPE_HEADER, RECEIVER_ERROR_CODES, RECEIVER_LOCK_CONFIRMATION, RECEIVER_TIMEOUTS, ReceiverMachine, assembleFrame, chunkFile, type TransferFrame } from '@qr-data-bridge/protocol';
 import { buildTransmissionFrames } from './senderCore';
 import { ReceiverIngestService } from '../../receiver/src/ingestService';
+
+
+async function enqueueHeaderLock(ingest: ReceiverIngestService, headerFrame: TransferFrame, startAt: number): Promise<number> {
+  if (headerFrame.frameType !== FRAME_TYPE_HEADER) throw new Error('Expected HEADER frame as first stream frame.');
+  const headerWire = assembleFrame(headerFrame);
+  let now = startAt;
+  for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+    await ingest.enqueue(headerWire, now);
+    now += 50;
+  }
+  return now;
+}
 
 describe('sender -> receiver e2e integration', () => {
   it('transmits sender-built frames through receiver ingest queue to SUCCESS', async () => {
@@ -12,9 +24,9 @@ describe('sender -> receiver e2e integration', () => {
     machine.startScanning();
     const ingest = new ReceiverIngestService({ machine });
 
-    let now = 1_000;
+    let now = await enqueueHeaderLock(ingest, frames[0], 1_000);
     let snapshot = machine.snapshot;
-    for (const frame of frames) {
+    for (const frame of frames.slice(1)) {
       const result = await ingest.enqueue(assembleFrame(frame), now);
       if (result) snapshot = result;
       now += 100;
@@ -26,7 +38,7 @@ describe('sender -> receiver e2e integration', () => {
     expect(snapshot.fileBytes).toEqual(fileBytes);
 
     const diagnostics = ingest.getDiagnostics();
-    expect(diagnostics.acceptedFrames).toBe(frames.length);
+    expect(diagnostics.acceptedFrames).toBe(frames.length + RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS - 1);
     expect(diagnostics.malformedPayloads).toBe(0);
     expect(diagnostics.badPacketCrcFrames).toBe(0);
     expect(diagnostics.finalizeDurationMs).not.toBeNull();
@@ -42,8 +54,8 @@ describe('sender -> receiver e2e integration', () => {
     machine.startScanning();
     const ingest = new ReceiverIngestService({ machine });
 
-    await ingest.enqueue(assembleFrame(frames[0]), 2_000);
-    await ingest.enqueue(assembleFrame(frames[1]), 2_100);
+    const now = await enqueueHeaderLock(ingest, frames[0], 2_000);
+    await ingest.enqueue(assembleFrame(frames[1]), now + 50);
 
     const snapshot = machine.snapshot;
     expect(snapshot.state).toBe('SUCCESS');
@@ -66,7 +78,9 @@ describe('sender -> receiver e2e integration', () => {
     const corruptedFirstData = firstDataWire.slice();
     corruptedFirstData[17] ^= 0xff;
 
-    await ingest.enqueue(headerWire, 3_000);
+    for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+      await ingest.enqueue(headerWire, 3_000 + (i * 50));
+    }
     await ingest.enqueue(corruptedFirstData, 3_100);
     await ingest.enqueue(secondDataWire, 3_200);
     await ingest.enqueue(firstDataWire, 3_300);
@@ -92,8 +106,10 @@ describe('sender -> receiver e2e integration', () => {
     await ingest.enqueue(new TextEncoder().encode('not-a-protocol-payload'), now);
 
     const firstFrameBytes = assembleFrame(frames[0]);
-    await ingest.enqueue(firstFrameBytes, now + 50);
-    await ingest.enqueue(firstFrameBytes, now + 100);
+    for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+      await ingest.enqueue(firstFrameBytes, now + 50 + (i * 50));
+    }
+    await ingest.enqueue(firstFrameBytes, now + 300);
 
     for (const frame of frames.slice(1)) {
       now += 100;
@@ -117,8 +133,7 @@ describe('sender -> receiver e2e integration', () => {
     machine.startScanning();
     const ingest = new ReceiverIngestService({ machine });
 
-    let now = 10_000;
-    await ingest.enqueue(assembleFrame(transferA.frames[0]), now);
+    let now = await enqueueHeaderLock(ingest, transferA.frames[0], 10_000);
     await ingest.enqueue(assembleFrame(transferB.header), now + 50);
     await ingest.enqueue(assembleFrame(transferB.dataFrames[0]), now + 100);
 
@@ -142,11 +157,11 @@ describe('sender -> receiver e2e integration', () => {
     machine.startScanning();
     const ingest = new ReceiverIngestService({ machine });
 
-    await ingest.enqueue(assembleFrame(frames[0]), 20_000);
-    await ingest.enqueue(assembleFrame(frames[1]), 20_100);
-    await ingest.enqueue(assembleFrame(frames.at(-1)!), 20_200);
+    const now = await enqueueHeaderLock(ingest, frames[0], 20_000);
+    await ingest.enqueue(assembleFrame(frames[1]), now + 50);
+    await ingest.enqueue(assembleFrame(frames.at(-1)!), now + 100);
 
-    const timeoutSnapshot = machine.tick(22_300);
+    const timeoutSnapshot = machine.tick(now + 100 + RECEIVER_TIMEOUTS.END_GRACE_MS + RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS + 1);
     expect(timeoutSnapshot.state).toBe('ERROR');
     expect(timeoutSnapshot.error?.code).toBe(RECEIVER_ERROR_CODES.END_INCOMPLETE);
   });

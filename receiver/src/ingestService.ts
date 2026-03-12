@@ -85,8 +85,6 @@ export class ReceiverIngestService {
 
   private readonly pendingKeyToIndex = new Map<string, number>();
 
-  private readonly lastAcceptedSeqBySessionStream = new Map<string, number>();
-
   constructor(
     private readonly deps: {
       machine: ReceiverMachine;
@@ -103,7 +101,6 @@ export class ReceiverIngestService {
     this.firstAcceptedAt = null;
     this.pendingIngestions.length = 0;
     this.pendingKeyToIndex.clear();
-    this.lastAcceptedSeqBySessionStream.clear();
     this.ingestionChain = Promise.resolve(null);
     this.diagnosticsValue = {
       totalPayloadsSeen: 0,
@@ -230,25 +227,7 @@ export class ReceiverIngestService {
         return null;
       }
 
-      if (frame.frameType === FRAME_TYPE_DATA && before.lockConfirmed && before.transferId) {
-        const sequenceKey = `${tuple.sessionId}|${tuple.streamId}`;
-        const lastAcceptedSeq = this.lastAcceptedSeqBySessionStream.get(sequenceKey);
-        if (lastAcceptedSeq !== undefined && tuple.seq <= lastAcceptedSeq) {
-          this.deps.onEvent?.({ type: 'frameDropped', reason: 'replayedSequence', tuple });
-          return null;
-        }
-      }
-
       const snapshot = this.deps.machine.applyFrame(frame, now);
-
-      if (!before.lockConfirmed && snapshot.lockConfirmed && snapshot.transferId) {
-        this.lastAcceptedSeqBySessionStream.clear();
-      }
-
-      if (snapshot.lockConfirmed || frame.frameType === FRAME_TYPE_HEADER) {
-        const sequenceKey = `${tuple.sessionId}|${tuple.streamId}`;
-        this.lastAcceptedSeqBySessionStream.set(sequenceKey, tuple.seq);
-      }
 
       this.diagnosticsValue.acceptedFrames += 1;
       this.firstAcceptedAt = this.firstAcceptedAt ?? now;

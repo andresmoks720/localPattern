@@ -76,7 +76,7 @@ describe('ReceiverIngestService', () => {
     const diagnostics = service.getDiagnostics();
     expect(diagnostics.totalPayloadsSeen).toBe(6);
     expect(diagnostics.duplicateScannerPayloads).toBe(1);
-    expect(diagnostics.acceptedFrames).toBe(4);
+    expect(diagnostics.acceptedFrames).toBe(5);
     expect(events).toContain('duplicateScannerPayload');
   });
 
@@ -100,7 +100,7 @@ describe('ReceiverIngestService', () => {
 
 
 
-  it('drops replayed data sequence numbers for locked session and logs tuple metadata', () => {
+  it('does not drop out-of-order data sequence numbers for locked session', () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
     const dropped: string[] = [];
@@ -130,7 +130,7 @@ describe('ReceiverIngestService', () => {
     service.ingest(assembleFrame(replayedPacket0DifferentPayload), 1011);
 
     expect(accepted).toContain(`${machine.snapshot.transferId}:DATA:0`);
-    expect(dropped.some((entry) => entry.includes('replayedSequence') && entry.endsWith(':DATA:0'))).toBe(true);
+    expect(dropped.some((entry) => entry.includes('replayedSequence'))).toBe(false);
   });
 
   it('resets sequence tracking after a validated new session start lock', () => {
