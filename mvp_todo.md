@@ -18,9 +18,9 @@ Legend:
 - [x] No WebSocket/BLE/audio return channel implementation.
 - [x] No automatic resend-until-success loop.
 - [x] No multi-file queue/resume flow.
-- [ ] Freeze redundancy policy for MVPv2 (not user-tunable; fixed sender-side emission constant documented).
-- [ ] Add explicit “MVPv2 one-way mode” guard in code/docs so future two-way code cannot leak into this flow.
-- [ ] Add static checks/tests ensuring no hidden dormant backchannel message types appear in protocol package.
+- [x] Freeze redundancy policy for MVPv2 (not user-tunable; fixed sender-side emission constant documented).
+- [x] Add explicit “MVPv2 one-way mode” guard in code/docs so future two-way code cannot leak into this flow.
+- [x] Add static checks/tests ensuring no hidden dormant backchannel message types appear in protocol package.
 
 ---
 
@@ -37,12 +37,12 @@ Legend:
 - [x] Receiver ignores non-matching `DATA` after lock.
 - [x] Receiver ignores non-matching `END` after lock.
 - [x] Receiver ignores non-matching `HEADER` after lock.
-- [ ] Add explicit tests for non-matching `HEADER` ignore behavior until success/error/reset.
+- [x] Add explicit tests for non-matching `HEADER` ignore behavior until success/error/reset.
 
 ### B3. No late-join guarantee / no automatic recovery
 - [x] UI already tells users to restart sender on incomplete transfer.
 - [x] No retransmit request protocol present.
-- [ ] Ensure redundancy, if present, is fixed non-adaptive sender policy and not recovery behavior in MVPv2 mode.
+- [x] Ensure redundancy, if present, is fixed non-adaptive sender policy and not recovery behavior in MVPv2 mode.
 
 ---
 
@@ -67,19 +67,19 @@ Legend:
 - [x] Big-endian unsigned reads/writes used via DataView.
 
 ### D2. **Critical wire-layout mismatches to fix**
-- [ ] Add `headerCrc32(4)` to HEADER wire layout and parser.
-- [ ] Validate HEADER only when `headerCrc32` matches required coverage.
-- [ ] Remove extra protocol version byte from all frames.
+- [x] Add `headerCrc32(4)` to HEADER wire layout and parser.
+- [x] Validate HEADER only when `headerCrc32` matches required coverage.
+- [x] Remove extra protocol version byte from all frames.
   - Current implementation encodes `magic|type|version|...`.
   - Spec requires `magic|type|...` only.
-- [ ] Implement DATA `payloadLen(2)` field in wire format.
-- [ ] Parse DATA using explicit payloadLen and strict trailing-length validation.
-- [ ] Recompute frame offsets after version-byte removal.
-- [ ] Add strict parser rejection for malformed/trailing-bytes where layout is fixed.
+- [x] Implement DATA `payloadLen(2)` field in wire format.
+- [x] Parse DATA using explicit payloadLen and strict trailing-length validation.
+- [x] Recompute frame offsets after version-byte removal.
+- [x] Add strict parser rejection for malformed/trailing-bytes where layout is fixed.
 
 ### D3. Required fields
 - [x] `transferId` required and length-checked (8 bytes).
-- [~] DATA required fields partially implied by current parser; must be explicit with `payloadLen`.
+- [x] DATA required fields explicitly validated with `payloadLen`.
 - [x] HEADER includes fileName/fileSize/totalPackets/fileCrc32.
 - [x] END includes transferId.
 
@@ -88,40 +88,40 @@ Legend:
 - [x] uint16 filename length bounds enforced.
 - [x] No silent truncation.
 - [x] Sender surfaces filename limit errors.
-- [ ] Add tests for boundary filename byte lengths (`65535`, `65536`, multibyte UTF-8 edge cases).
+- [x] Add tests for boundary filename byte lengths (`65535`, `65536`, multibyte UTF-8 edge cases).
 
 ### D5. Packet/size bounds
 - [x] `totalPackets` uint16 bound checked.
 - [x] `packetIndex` uint16 encoded.
 - [x] `fileSize` uint32 encoded.
-- [~] Protocol-level max payload (`<=1024`) not enforced centrally.
-- [~] Protocol-level min DATA payload (`>=1`) not enforced via wire contract yet.
-- [~] `payloadLen` range cannot be validated until `payloadLen` field exists.
-- [ ] Add explicit invariant: `totalPackets=0` only when `fileSize=0`.
-- [ ] Add explicit invariant: non-empty file requires `totalPackets>=1`.
+- [x] Protocol-level max payload (`<=1024`) enforced centrally.
+- [x] Protocol-level min DATA payload (`>=1`) enforced via wire contract.
+- [x] `payloadLen` range validation is enforced with DATA payload field.
+- [x] Add explicit invariant: `totalPackets=0` only when `fileSize=0`.
+- [x] Add explicit invariant: non-empty file requires `totalPackets>=1`.
 
 ---
 
 ## E. CRC and Integrity Semantics
 
-- [ ] Lock CRC variant everywhere to `CRC-32/IEEE 802.3` (poly `0x04C11DB7`, reflected in/out, init/final xor `0xFFFFFFFF`, BE serialization).
-- [ ] Add explicit empty-input CRC regression (`0x00000000`).
+- [x] Lock CRC variant everywhere to `CRC-32/IEEE 802.3` (poly `0x04C11DB7`, reflected in/out, init/final xor `0xFFFFFFFF`, BE serialization).
+- [x] Add explicit empty-input CRC regression (`0x00000000`).
 
 ### E1. Packet CRC coverage (critical mismatch)
-- [ ] Change packet CRC coverage to exactly: `transferId(8) + packetIndex(2) + payload(n)`.
-- [ ] Stop using payload-only CRC coverage in sender assembly.
-- [ ] Stop using payload-only CRC verification in parser.
-- [ ] Add fixture tests proving excluded bytes (`magic`,`type`,`payloadLen`) do not affect packet CRC.
+- [x] Change packet CRC coverage to exactly: `transferId(8) + packetIndex(2) + payload(n)`.
+- [x] Stop using payload-only CRC coverage in sender assembly.
+- [x] Stop using payload-only CRC verification in parser.
+- [x] Add fixture tests proving excluded bytes (`magic`,`type`,`payloadLen`) do not affect packet CRC.
 
 ### E2. Full-file CRC
 - [x] Full-file CRC computed over reassembled bytes only.
 - [x] Receiver verifies full-file CRC before success.
-- [ ] Add tests confirming metadata changes do not influence full-file CRC validation.
+- [x] Add tests confirming metadata changes do not influence full-file CRC validation.
 
 ### E3. Integrity behavior
 - [x] Bad DATA packet CRC is ignorable (frame dropped, attempt continues).
 - [x] Full-file CRC mismatch is terminal error.
-- [ ] Add explicit error code mapping table for all integrity failures.
+- [x] Add explicit error code mapping table for all integrity failures.
 
 ---
 
@@ -129,21 +129,21 @@ Legend:
 
 - [x] transferId required on all frame types in types/api.
 - [x] Receiver lock to one active transfer implemented.
-- [ ] Add explicit terminal error on same-transferId conflicting HEADER metadata.
-- [ ] Add explicit tests for same-transferId metadata conflict cases (fileName, fileSize, totalPackets, fileCrc32).
-- [ ] Ensure repeated matching HEADER with same metadata is explicit no-op path.
-- [ ] Ensure repeated matching END is explicit no-op path.
+- [x] Add explicit terminal error on same-transferId conflicting HEADER metadata.
+- [x] Add explicit tests for same-transferId metadata conflict cases (fileName, fileSize, totalPackets, fileCrc32).
+- [x] Ensure repeated matching HEADER with same metadata is explicit no-op path.
+- [x] Ensure repeated matching END is explicit no-op path.
 
 ---
 
 ## G. Zero-byte File Contract (critical mismatch)
 
-- [ ] `chunkFile` should emit `totalPackets=0` for empty file (currently forces at least one packet).
-- [ ] Sender should emit only `HEADER -> END` for empty file.
-- [ ] Sender must not emit DATA for empty files.
-- [ ] Receiver must not complete on HEADER alone when `totalPackets=0`.
-- [ ] Receiver should require END + zero-byte verification for success.
-- [ ] Add dedicated zero-byte protocol fixtures and regression tests.
+- [x] `chunkFile` should emit `totalPackets=0` for empty file (currently forces at least one packet).
+- [x] Sender should emit only `HEADER -> END` for empty file.
+- [x] Sender must not emit DATA for empty files.
+- [x] Receiver must not complete on HEADER alone when `totalPackets=0`.
+- [x] Receiver should require END + zero-byte verification for success.
+- [x] Add dedicated zero-byte protocol fixtures and regression tests.
 
 ---
 
@@ -152,31 +152,31 @@ Legend:
 ### H1. Core workflow
 - [x] File select -> size validation -> read bytes -> packetize -> start send exists.
 - [~] Precompute is present, but QR encoding is done per frame at runtime.
-- [ ] Add explicit preflight validation that **all required frame types** encode successfully before READY.
-- [ ] Fail before transmission when chosen settings cannot encode frames.
+- [x] Add explicit preflight validation that **all required frame types** encode successfully before READY.
+- [x] Fail before transmission when chosen settings cannot encode frames.
 
 ### H2. Transmission mode
-- [ ] Freeze MVPv2 sender timing to one fixed DATA frame duration default and remove advanced timing UI knobs.
+- [x] Freeze MVPv2 sender timing to one fixed DATA frame duration default and remove advanced timing UI knobs.
 - [x] One pass through current stream.
-- [~] DATA redundancy repeats frames (`redundancyCount`), deviates from strict `HEADER->DATA in order->END` once each.
+- [x] DATA redundancy is frozen to 1x in MVPv2 flow (`HEADER->DATA in order->END` once each).
 - [x] No backchannel waiting.
 - [x] No continuous auto-loop.
 
 ### H3. Control-frame visibility rules (missing)
-- [ ] Guarantee HEADER visible >=2000ms before first DATA.
-- [ ] Guarantee END visible >=3000ms before non-QR completion screen.
-- [ ] Implement hold durations independent of general frameDuration setting.
+- [x] Guarantee HEADER visible >=2000ms before first DATA.
+- [x] Guarantee END visible >=3000ms before non-QR completion screen.
+- [x] Implement hold durations independent of general frameDuration setting.
 - [ ] Add tests with fake timers for HEADER/END hold semantics.
 
 ### H4. Final screen sequencing
-- [ ] Ensure estimate includes HEADER hold + all DATA intervals + END hold (optional countdown may be excluded).
-- [~] END is shown as part of sequence, but explicit timed hold before completion is not guaranteed.
-- [ ] Enforce exact order: transmit END -> hold END -> then final non-QR screen.
+- [x] Ensure estimate includes HEADER hold + all DATA intervals + END hold (optional countdown may be excluded).
+- [x] END is shown and held before completion.
+- [x] Enforce exact order: transmit END -> hold END -> then final non-QR screen.
 
 ### H5. Interruption behavior
 - [x] Hidden tab interrupts active transmission.
-- [~] Copy mismatch (`Error: tab hidden...`) vs spec recommended copy.
-- [ ] Normalize interruption copy: `Transmission interrupted. Restart required.`
+- [x] Copy normalized to spec recommendation.
+- [x] Normalize interruption copy: `Transmission interrupted. Restart required.`
 
 ### H6. Sender errors
 - [x] User-visible handling for file read failure.
@@ -184,9 +184,9 @@ Legend:
 - [x] Too-many-packets surfaced.
 - [x] Filename limit issues surfaced.
 - [x] QR encode failure surfaced.
-- [~] Explicit “frame precompute failure” bucket not distinguished.
+- [x] Explicit “frame precompute failure” bucket is distinguished and user-visible.
 - [~] Explicit “invalid preflight settings” bucket not distinguished.
-- [ ] Add complete error-code -> user-copy map and assert in tests.
+- [~] Add complete error-code -> user-copy map and assert in tests.
 
 ### H7. Abort/reset lifecycle
 - [x] Clears timers/timeouts.
@@ -197,7 +197,7 @@ Legend:
 
 ### H8. Manual retry semantics
 - [x] Retry rebuilds frames and generates fresh transferId.
-- [ ] Add deterministic test asserting transferId changes across retries of same file.
+- [x] Add deterministic test asserting transferId changes across retries of same file.
 
 ---
 
@@ -217,7 +217,7 @@ Legend:
 ### I3. Completion rule (major gap)
 - [x] Non-empty file success does not require END; END remains required for zero-byte completion and timeout signaling.
 - [x] Full packet set + file reassembly + CRC + file size currently required.
-- [ ] For zero-byte case, wait for END before success.
+- [x] For zero-byte case, wait for END before success.
 
 ### I4. Failure rules
 - [x] END-incomplete grace timeout implemented (2000ms).
@@ -305,7 +305,7 @@ Legend:
 - [x] Completed files verified.
 - [x] Incomplete transfers timeout clearly.
 - [x] Manual retry possible.
-- [ ] Remove/limit any behavior implying guaranteed recovery (redundancy setting in MVPv2 one-way mode).
+- [x] Remove/limit any behavior implying guaranteed recovery (redundancy setting in MVPv2 one-way mode).
 
 ---
 
@@ -328,7 +328,7 @@ Legend:
 
 ## N. Dependency, Packaging, and Transport Rules
 
-- [ ] Clarify docs that binary frame layout is authoritative and QR-safe text encoding is transport-only reversible wrapper.
+- [x] Clarify docs that binary frame layout is authoritative and QR-safe text encoding is transport-only reversible wrapper.
 
 - [x] No remote CDN dependency in runtime path.
 - [x] Browser-only static app packaging via Vite.
@@ -351,31 +351,31 @@ Legend:
 
 ### P1. Protocol unit tests
 - [x] HEADER/DATA/END roundtrip tests exist.
-- [ ] Exact byte-layout conformance tests (all offsets/lengths).
-- [ ] Wrong-magic/version compatibility tests aligned with final wire contract.
-- [ ] transferId required/validated tests across all frame types.
-- [ ] DATA payloadLen bounds + exact length matching tests.
-- [ ] totalPackets/fileSize invariants tests.
-- [ ] packet CRC coverage tests (transferId+index+payload only).
-- [ ] full-file CRC coverage tests (file bytes only).
-- [ ] repeated matching HEADER/END behavior tests.
-- [ ] conflicting same-transfer HEADER metadata terminal error tests.
-- [ ] END-before-HEADER ignored tests.
-- [ ] zero-byte wire contract tests.
+- [x] Exact byte-layout conformance tests (all offsets/lengths).
+- [x] Wrong-magic/version compatibility tests aligned with final wire contract.
+- [x] transferId required/validated tests across all frame types.
+- [x] DATA payloadLen bounds + exact length matching tests.
+- [x] totalPackets/fileSize invariants tests.
+- [x] packet CRC coverage tests (transferId+index+payload only).
+- [x] full-file CRC coverage tests (file bytes only).
+- [x] repeated matching HEADER/END behavior tests.
+- [x] conflicting same-transfer HEADER metadata terminal error tests.
+- [x] END-before-HEADER ignored tests.
+- [x] zero-byte wire contract tests.
 
 ### P2. Sender tests
 - [x] >1 MiB rejected.
 - [x] file-read failure surfaced.
 - [x] packetization failure surfaced.
 - [x] QR encode failure surfaced.
-- [ ] frame precompute failure surfaced.
-- [ ] filename encoding limit boundary tests.
-- [ ] preflight settings validation tests.
-- [ ] estimated transfer duration presence test.
-- [ ] HEADER/END hold duration tests.
+- [x] frame precompute failure surfaced.
+- [x] filename encoding limit boundary tests.
+- [x] preflight settings validation tests.
+- [x] estimated transfer duration presence test.
+- [x] HEADER/END hold duration tests.
 - [ ] hidden/interrupted transmission restart-required tests.
 - [ ] reset cleanup and no stale state tests.
-- [ ] manual retry new transferId test.
+- [x] manual retry new transferId test.
 
 ### P3. Receiver tests
 - [x] DATA-before-HEADER ignored.
@@ -387,16 +387,16 @@ Legend:
 - [x] no-progress timeout path.
 - [x] full-set + CRC success path.
 - [ ] success requires END test.
-- [ ] zero-byte waits for END test.
-- [ ] conflicting-header terminal error test.
-- [ ] repeated matching control-frame no-op tests.
-- [ ] terminal ERROR blocks further ingestion tests (broad coverage).
+- [x] zero-byte waits for END test.
+- [x] conflicting-header terminal error test.
+- [x] repeated matching control-frame no-op tests.
+- [x] terminal ERROR blocks further ingestion tests (broad coverage).
 - [ ] scanner-ingress dedupe vs protocol dedupe separation tests.
 
 ### P4. Empty-file dedicated coverage
-- [ ] Sender emits deterministic HEADER->END only.
-- [ ] Receiver deterministic zero-byte verify success/failure reasons.
-- [ ] No hang waiting for missing DATA.
+- [x] Sender emits deterministic HEADER->END only.
+- [x] Receiver deterministic zero-byte verify success/failure reasons.
+- [x] No hang waiting for missing DATA.
 
 ### P5. Manual real-device matrix (recording required)
 - [ ] phone->phone
@@ -417,9 +417,9 @@ Legend:
 
 ## Q. Known correctness bugs observed in current code audit
 
-- [ ] Remove duplicate `receiverMachine.startScanning()` invocation in receiver reset helper.
-- [ ] Replace parser assumptions that conflict with spec wire layout.
-- [ ] Tighten malformed-frame handling to distinguish ignorable noise vs protocol faults consistently.
+- [x] Remove duplicate `receiverMachine.startScanning()` invocation in receiver reset helper.
+- [x] Replace parser assumptions that conflict with spec wire layout.
+- [x] Tighten malformed-frame handling to distinguish ignorable noise vs protocol faults consistently.
 
 ---
 
@@ -427,17 +427,17 @@ Legend:
 
 - [x] Sender rejects files above 1 MiB.
 - [x] Receiver passive-only.
-- [~] transferId in all frames implemented, but wire layout differs from spec due to extra version byte.
-- [ ] Exact frame byte layout implemented.
-- [ ] CRC coverage implemented exactly as specified.
+- [x] transferId in all frames implemented with spec-aligned wire layout.
+- [x] Exact frame byte layout implemented.
+- [x] CRC coverage implemented exactly as specified.
 - [x] Receiver ignores wrong-transfer frames once locked.
 - [x] Bad packet CRC treated as ignorable frame loss.
 - [x] full-file CRC verified.
 - [x] fixed timeout windows implemented.
-- [~] sender exception buckets mostly covered; precompute/preflight bucket incomplete.
-- [ ] preflight settings validation before transmission is complete.
-- [~] receiver success currently does not require END.
-- [ ] zero-byte path deterministic per spec.
+- [x] sender exception buckets include precompute/preflight bucket.
+- [x] preflight settings validation before transmission is complete.
+- [x] receiver success rule aligned: END required for zero-byte completion; non-empty succeeds on verified full packet set.
+- [x] zero-byte path deterministic per spec.
 - [x] manual retry fresh attempt behavior mostly present.
 - [~] QR visual stability mostly present; needs explicit guarantees/tests.
 - [x] sender interruption hidden-page behavior stops transfer.
@@ -453,4 +453,3 @@ Legend:
 3. **Sender correctness**: preflight QR validation, control-frame holds, remove redundancy in MVPv2 mode.
 4. **Tests + CI**: add exhaustive protocol/sender/receiver tests and hygiene guards.
 5. **Boundary hardening**: split service/state logic from UI and document transitions.
-

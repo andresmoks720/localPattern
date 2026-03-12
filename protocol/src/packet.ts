@@ -5,7 +5,6 @@ import {
   FRAME_TYPE_HEADER,
   LEGACY_MAGIC_BYTES,
   MAGIC_BYTES,
-  PROTOCOL_VERSION_BYTE,
   PROTOCOL_ERROR_CODES,
   ProtocolError,
   type ChunkFileOptions,
@@ -17,6 +16,7 @@ import {
 } from './types';
 
 export const DEFAULT_MAX_PAYLOAD_SIZE = 512;
+export const MAX_DATA_PAYLOAD_SIZE = 1024;
 const TRANSFER_ID_SIZE = 8;
 
 const textEncoder = new TextEncoder();
@@ -38,6 +38,49 @@ function assertTransferId(transferId: Uint8Array): void {
   if (transferId.length !== TRANSFER_ID_SIZE) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_TRANSFER_ID, 'transferId must be exactly 8 bytes.');
   }
+}
+
+function assertTotalPacketsInvariant(fileSize: number, totalPackets: number): void {
+  if (fileSize === 0 && totalPackets !== 0) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_TOTAL_PACKETS, 'totalPackets must be 0 when fileSize is 0.');
+  }
+
+  if (fileSize > 0 && totalPackets < 1) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_TOTAL_PACKETS, 'totalPackets must be >= 1 for non-empty files.');
+  }
+}
+
+function computeHeaderCrc32(frame: {
+  transferId: Uint8Array;
+  encodedFileName: Uint8Array;
+  fileSize: number;
+  totalPackets: number;
+  fileCrc32: number;
+}): number {
+  const crcBytes = new Uint8Array(TRANSFER_ID_SIZE + 2 + frame.encodedFileName.length + 4 + 2 + 4);
+  const view = new DataView(crcBytes.buffer, crcBytes.byteOffset, crcBytes.byteLength);
+
+  crcBytes.set(frame.transferId, 0);
+  view.setUint16(TRANSFER_ID_SIZE, frame.encodedFileName.length);
+  crcBytes.set(frame.encodedFileName, TRANSFER_ID_SIZE + 2);
+
+  const tailOffset = TRANSFER_ID_SIZE + 2 + frame.encodedFileName.length;
+  view.setUint32(tailOffset, frame.fileSize);
+  view.setUint16(tailOffset + 4, frame.totalPackets);
+  view.setUint32(tailOffset + 6, frame.fileCrc32);
+
+  return calculateCRC32(crcBytes);
+}
+
+function computePacketCrc32(transferId: Uint8Array, packetIndex: number, payload: Uint8Array): number {
+  const crcBytes = new Uint8Array(TRANSFER_ID_SIZE + 2 + payload.length);
+  const view = new DataView(crcBytes.buffer, crcBytes.byteOffset, crcBytes.byteLength);
+
+  crcBytes.set(transferId, 0);
+  view.setUint16(TRANSFER_ID_SIZE, packetIndex);
+  crcBytes.set(payload, TRANSFER_ID_SIZE + 2);
+
+  return calculateCRC32(crcBytes);
 }
 
 export function createTransferId(): Uint8Array {
@@ -66,6 +109,7 @@ function assembleHeaderFrame(frame: TransferHeaderFrame): Uint8Array {
   assertTransferId(frame.transferId);
   assertUint32(frame.fileSize, 'fileSize');
   assertUint16(frame.totalPackets, 'totalPackets');
+  assertTotalPacketsInvariant(frame.fileSize, frame.totalPackets);
 
   const normalizedFileName = frame.fileName.trim();
   if (!normalizedFileName) {
@@ -74,49 +118,67 @@ function assembleHeaderFrame(frame: TransferHeaderFrame): Uint8Array {
   const encodedFileName = textEncoder.encode(normalizedFileName);
   assertUint16(encodedFileName.length, 'fileName byte length');
 
-  const bytes = new Uint8Array(4 + 1 + 1 + TRANSFER_ID_SIZE + 2 + encodedFileName.length + 4 + 2 + 4);
+  const computedHeaderCrc32 = computeHeaderCrc32({
+    transferId: frame.transferId,
+    encodedFileName,
+    fileSize: frame.fileSize,
+    totalPackets: frame.totalPackets,
+    fileCrc32: frame.fileCrc32
+  });
+
+  if (computedHeaderCrc32 !== frame.headerCrc32) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.HEADER_CRC_MISMATCH, 'headerCrc32 mismatch for header frame.');
+  }
+
+  const bytes = new Uint8Array(4 + 1 + TRANSFER_ID_SIZE + 2 + encodedFileName.length + 4 + 2 + 4 + 4);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   bytes.set(MAGIC_BYTES, 0);
   view.setUint8(4, FRAME_TYPE_HEADER);
-  view.setUint8(5, PROTOCOL_VERSION_BYTE);
-  bytes.set(frame.transferId, 6);
-  view.setUint16(14, encodedFileName.length);
-  bytes.set(encodedFileName, 16);
-  const offset = 16 + encodedFileName.length;
+  bytes.set(frame.transferId, 5);
+  view.setUint16(13, encodedFileName.length);
+  bytes.set(encodedFileName, 15);
+  const offset = 15 + encodedFileName.length;
   view.setUint32(offset, frame.fileSize);
   view.setUint16(offset + 4, frame.totalPackets);
   view.setUint32(offset + 6, frame.fileCrc32);
+  view.setUint32(offset + 10, frame.headerCrc32);
   return bytes;
 }
 
 function assembleDataFrame(frame: TransferDataFrame): Uint8Array {
   assertUint16(frame.packetIndex, 'packetIndex');
-  const computedPacketCrc32 = calculateCRC32(frame.payload);
+  assertTransferId(frame.transferId);
+
+  if (!Number.isInteger(frame.payloadLen) || frame.payloadLen !== frame.payload.length) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_PAYLOAD_LENGTH, 'payloadLen must exactly match payload byte length.');
+  }
+  if (frame.payloadLen < 1 || frame.payloadLen > MAX_DATA_PAYLOAD_SIZE) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_PAYLOAD_LENGTH, `payloadLen must be between 1 and ${MAX_DATA_PAYLOAD_SIZE}.`);
+  }
+
+  const computedPacketCrc32 = computePacketCrc32(frame.transferId, frame.packetIndex, frame.payload);
   if (computedPacketCrc32 !== frame.packetCrc32) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.PACKET_CRC_MISMATCH, 'packetCrc32 mismatch for data payload.');
   }
 
-  assertTransferId(frame.transferId);
-
-  const bytes = new Uint8Array(4 + 1 + 1 + TRANSFER_ID_SIZE + 2 + frame.payload.length + 4);
+  const bytes = new Uint8Array(4 + 1 + TRANSFER_ID_SIZE + 2 + 2 + frame.payload.length + 4);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   bytes.set(MAGIC_BYTES, 0);
   view.setUint8(4, FRAME_TYPE_DATA);
-  view.setUint8(5, PROTOCOL_VERSION_BYTE);
-  bytes.set(frame.transferId, 6);
-  view.setUint16(14, frame.packetIndex);
-  bytes.set(frame.payload, 16);
-  view.setUint32(16 + frame.payload.length, frame.packetCrc32);
+  bytes.set(frame.transferId, 5);
+  view.setUint16(13, frame.packetIndex);
+  view.setUint16(15, frame.payloadLen);
+  bytes.set(frame.payload, 17);
+  view.setUint32(17 + frame.payload.length, frame.packetCrc32);
   return bytes;
 }
 
 function assembleEndFrame(frame: TransferEndFrame): Uint8Array {
   assertTransferId(frame.transferId);
-  const bytes = new Uint8Array(4 + 1 + 1 + TRANSFER_ID_SIZE);
+  const bytes = new Uint8Array(4 + 1 + TRANSFER_ID_SIZE);
   bytes.set(MAGIC_BYTES, 0);
   bytes[4] = FRAME_TYPE_END;
-  bytes[5] = PROTOCOL_VERSION_BYTE;
-  bytes.set(frame.transferId, 6);
+  bytes.set(frame.transferId, 5);
   return bytes;
 }
 
@@ -134,14 +196,6 @@ export function parseFrame(frameBytes: Uint8Array): TransferFrame {
   }
 
   const frameType = frameBytes[4];
-  if (frameBytes.length < 6) {
-    throw new ProtocolError(PROTOCOL_ERROR_CODES.FRAME_TOO_SMALL, 'Frame missing protocol version byte.');
-  }
-
-  const version = frameBytes[5];
-  if (version !== PROTOCOL_VERSION_BYTE) {
-    throw new ProtocolError(PROTOCOL_ERROR_CODES.UNSUPPORTED_VERSION, 'Unsupported protocol version byte.');
-  }
   if (frameType === FRAME_TYPE_HEADER) {
     return parseHeaderFrame(frameBytes);
   }
@@ -156,18 +210,18 @@ export function parseFrame(frameBytes: Uint8Array): TransferFrame {
 }
 
 function parseHeaderFrame(frameBytes: Uint8Array): TransferHeaderFrame {
-  if (frameBytes.length < 4 + 1 + 1 + TRANSFER_ID_SIZE + 2 + 4 + 2 + 4) {
+  if (frameBytes.length < 4 + 1 + TRANSFER_ID_SIZE + 2 + 4 + 2 + 4 + 4) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_HEADER, 'Header frame is too small.');
   }
 
   const view = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
-  const transferId = frameBytes.slice(6, 14);
-  const fileNameLength = view.getUint16(14);
-  const nameStart = 16;
+  const transferId = frameBytes.slice(5, 13);
+  const fileNameLength = view.getUint16(13);
+  const nameStart = 15;
   const nameEnd = nameStart + fileNameLength;
   const tailStart = nameEnd;
 
-  if (tailStart + 10 > frameBytes.length) {
+  if (tailStart + 14 !== frameBytes.length) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_HEADER, 'Malformed header frame.');
   }
 
@@ -175,6 +229,21 @@ function parseHeaderFrame(frameBytes: Uint8Array): TransferHeaderFrame {
   const fileSize = view.getUint32(tailStart);
   const totalPackets = view.getUint16(tailStart + 4);
   const fileCrc32 = view.getUint32(tailStart + 6);
+  const headerCrc32 = view.getUint32(tailStart + 10);
+
+  assertTotalPacketsInvariant(fileSize, totalPackets);
+
+  const computedHeaderCrc32 = computeHeaderCrc32({
+    transferId,
+    encodedFileName: frameBytes.slice(nameStart, nameEnd),
+    fileSize,
+    totalPackets,
+    fileCrc32
+  });
+
+  if (computedHeaderCrc32 !== headerCrc32) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.HEADER_CRC_MISMATCH, 'Header CRC32 check failed.');
+  }
 
   return {
     frameType: FRAME_TYPE_HEADER,
@@ -182,29 +251,36 @@ function parseHeaderFrame(frameBytes: Uint8Array): TransferHeaderFrame {
     fileName,
     fileSize,
     totalPackets,
-    fileCrc32
+    fileCrc32,
+    headerCrc32
   };
 }
 
 function parseDataFrame(frameBytes: Uint8Array): TransferDataFrame {
-  if (frameBytes.length < 4 + 1 + 1 + TRANSFER_ID_SIZE + 2 + 4) {
+  if (frameBytes.length < 4 + 1 + TRANSFER_ID_SIZE + 2 + 2 + 1 + 4) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_DATA, 'Data frame is too small.');
   }
 
   const view = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
-  const transferId = frameBytes.slice(6, 14);
-  const packetIndex = view.getUint16(14);
-  const payloadStart = 16;
-  const payloadEnd = frameBytes.length - 4;
+  const transferId = frameBytes.slice(5, 13);
+  const packetIndex = view.getUint16(13);
+  const payloadLen = view.getUint16(15);
 
-  if (payloadEnd < payloadStart) {
-    throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_DATA, 'Malformed data frame payload offsets.');
+  if (payloadLen < 1 || payloadLen > MAX_DATA_PAYLOAD_SIZE) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_PAYLOAD_LENGTH, `payloadLen must be between 1 and ${MAX_DATA_PAYLOAD_SIZE}.`);
+  }
+
+  const payloadStart = 17;
+  const payloadEnd = payloadStart + payloadLen;
+
+  if (payloadEnd + 4 !== frameBytes.length) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_DATA, 'Malformed data frame payload length/trailing bytes.');
   }
 
   const payload = frameBytes.slice(payloadStart, payloadEnd);
   const packetCrc32 = view.getUint32(payloadEnd);
 
-  if (calculateCRC32(payload) !== packetCrc32) {
+  if (computePacketCrc32(transferId, packetIndex, payload) !== packetCrc32) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.PACKET_CRC_MISMATCH, 'Packet CRC32 check failed.');
   }
 
@@ -212,19 +288,20 @@ function parseDataFrame(frameBytes: Uint8Array): TransferDataFrame {
     frameType: FRAME_TYPE_DATA,
     transferId,
     packetIndex,
+    payloadLen,
     payload,
     packetCrc32
   };
 }
 
 function parseEndFrame(frameBytes: Uint8Array): TransferEndFrame {
-  if (frameBytes.length !== 4 + 1 + 1 + TRANSFER_ID_SIZE) {
+  if (frameBytes.length !== 4 + 1 + TRANSFER_ID_SIZE) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.MALFORMED_END, 'Malformed END frame.');
   }
 
   return {
     frameType: FRAME_TYPE_END,
-    transferId: frameBytes.slice(6, 14)
+    transferId: frameBytes.slice(5, 13)
   };
 }
 
@@ -233,12 +310,16 @@ export function chunkFile(file: Uint8Array, options: ChunkFileOptions = {}): Chu
   if (maxPayloadSize <= 0 || !Number.isInteger(maxPayloadSize)) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_MAX_PAYLOAD_SIZE, 'maxPayloadSize must be a positive integer.');
   }
+  if (maxPayloadSize > MAX_DATA_PAYLOAD_SIZE) {
+    throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_MAX_PAYLOAD_SIZE, `maxPayloadSize must be <= ${MAX_DATA_PAYLOAD_SIZE}.`);
+  }
 
   const normalizedFileName = options.fileName?.trim();
   if (!normalizedFileName) {
     throw new ProtocolError(PROTOCOL_ERROR_CODES.INVALID_FILE_NAME, 'fileName must not be empty.');
   }
-  const totalPackets = Math.max(1, Math.ceil(file.length / maxPayloadSize));
+
+  const totalPackets = file.length === 0 ? 0 : Math.ceil(file.length / maxPayloadSize);
   try {
     assertUint16(totalPackets, 'totalPackets');
   } catch (error) {
@@ -251,13 +332,26 @@ export function chunkFile(file: Uint8Array, options: ChunkFileOptions = {}): Chu
   const transferId = options.transferId ?? createTransferId();
   assertTransferId(transferId);
 
+  const encodedFileName = textEncoder.encode(normalizedFileName);
+  assertUint16(encodedFileName.length, 'fileName byte length');
+
+  const fileCrc32 = calculateCRC32(file);
+  const headerCrc32 = computeHeaderCrc32({
+    transferId,
+    encodedFileName,
+    fileSize: file.length,
+    totalPackets,
+    fileCrc32
+  });
+
   const header: TransferHeaderFrame = {
     frameType: FRAME_TYPE_HEADER,
     transferId,
     fileName: normalizedFileName,
     fileSize: file.length,
     totalPackets,
-    fileCrc32: calculateCRC32(file)
+    fileCrc32,
+    headerCrc32
   };
 
   const dataFrames: TransferDataFrame[] = [];
@@ -269,8 +363,9 @@ export function chunkFile(file: Uint8Array, options: ChunkFileOptions = {}): Chu
       frameType: FRAME_TYPE_DATA,
       transferId: transferId.slice(),
       packetIndex,
+      payloadLen: payload.length,
       payload,
-      packetCrc32: calculateCRC32(payload)
+      packetCrc32: computePacketCrc32(transferId, packetIndex, payload)
     });
   }
 

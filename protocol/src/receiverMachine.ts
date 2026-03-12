@@ -13,7 +13,8 @@ export const RECEIVER_ERROR_CODES = {
   NO_PROGRESS_TIMEOUT: 'NO_PROGRESS_TIMEOUT',
   MISSING_PACKET: 'MISSING_PACKET',
   FILE_CRC_MISMATCH: 'FILE_CRC_MISMATCH',
-  FILE_SIZE_MISMATCH: 'FILE_SIZE_MISMATCH'
+  FILE_SIZE_MISMATCH: 'FILE_SIZE_MISMATCH',
+  HEADER_CONFLICT: 'HEADER_CONFLICT'
 } as const;
 
 export type ReceiverErrorCode = (typeof RECEIVER_ERROR_CODES)[keyof typeof RECEIVER_ERROR_CODES];
@@ -137,6 +138,20 @@ export class ReceiverMachine {
       return;
     }
 
+    if (this.snapshotValue.transferId === incomingTransferId) {
+      const hasConflict = (
+        this.snapshotValue.fileName !== (frame.fileName || 'received.bin')
+        || this.snapshotValue.expectedFileSize !== frame.fileSize
+        || this.snapshotValue.totalPackets !== frame.totalPackets
+        || this.snapshotValue.fileCrc32 !== frame.fileCrc32
+      );
+
+      if (hasConflict) {
+        this.fail(RECEIVER_ERROR_CODES.HEADER_CONFLICT, 'Conflicting HEADER metadata for active transferId.');
+      }
+      return;
+    }
+
     this.snapshotValue.transferId = incomingTransferId;
     this.snapshotValue.fileName = frame.fileName || 'received.bin';
     this.snapshotValue.expectedFileSize = frame.fileSize;
@@ -165,6 +180,27 @@ export class ReceiverMachine {
 
   private evaluateCompletion(): ReceiverSnapshot {
     if (this.snapshotValue.totalPackets === null || this.snapshotValue.fileCrc32 === null) {
+      return this.snapshot;
+    }
+
+    if (this.snapshotValue.totalPackets === 0) {
+      if (this.snapshotValue.endSeenAt === null) {
+        return this.snapshot;
+      }
+
+      this.snapshotValue.state = 'VERIFYING';
+      const fileBytes = new Uint8Array();
+
+      if (calculateCRC32(fileBytes) !== this.snapshotValue.fileCrc32) {
+        return this.fail(RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH, 'File CRC32 mismatch detected.');
+      }
+
+      if (this.snapshotValue.expectedFileSize !== 0) {
+        return this.fail(RECEIVER_ERROR_CODES.FILE_SIZE_MISMATCH, 'File size mismatch detected during verification.');
+      }
+
+      this.snapshotValue.state = 'SUCCESS';
+      this.snapshotValue.fileBytes = fileBytes;
       return this.snapshot;
     }
 

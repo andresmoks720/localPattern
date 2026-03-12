@@ -5,10 +5,28 @@ import {
   assembleFrame,
   chunkFile,
   FRAME_TYPE_DATA,
+  FRAME_TYPE_END,
+  FRAME_TYPE_HEADER,
   type TransferFrame
 } from '@qr-data-bridge/protocol';
 
 export const MAX_FILE_SIZE_BYTES = 1024 * 1024;
+
+
+export const FIXED_DATA_FRAME_DURATION_MS = 2000;
+export const HEADER_HOLD_MS = 2000;
+export const END_HOLD_MS = 3000;
+
+export function getFrameDisplayDurationMs(frame: TransferFrame): number {
+  if (frame.frameType === FRAME_TYPE_HEADER) return HEADER_HOLD_MS;
+  if (frame.frameType === FRAME_TYPE_END) return END_HOLD_MS;
+  return FIXED_DATA_FRAME_DURATION_MS;
+}
+
+export function estimateTransmissionDurationMs(frames: TransferFrame[]): number {
+  return frames.reduce((sum, frame) => sum + getFrameDisplayDurationMs(frame), 0);
+}
+
 
 export interface SenderFailure {
   title: string;
@@ -27,7 +45,7 @@ function asErrorMessage(error: unknown, fallback: string): string {
 
 export function toUserFacingSenderError(error: unknown): SenderFailure {
   if (error instanceof ProtocolError) {
-    if (error.code === PROTOCOL_ERROR_CODES.INVALID_FILE_NAME) {
+    if (error.code === PROTOCOL_ERROR_CODES.INVALID_FILE_NAME || error.code === PROTOCOL_ERROR_CODES.INVALID_UINT16) {
       return {
         title: `Error: filename limit exceeded: ${error.message}`,
         warning: 'Rename the file to a shorter UTF-8 name and try again.'
@@ -104,6 +122,26 @@ export async function encodeFrameToCanvas(
   } catch (error) {
     const message = asErrorMessage(error, 'Unknown QR encoding error.');
     throw new Error(`Error: QR encode failed: ${message}`);
+  }
+}
+
+export async function preflightEncodeFrames(
+  frames: TransferFrame[],
+  options: { qrPrefix: string; qrErrorCorrection: QRCode.QRCodeErrorCorrectionLevel; qrSizePx: number },
+  deps: { toCanvas: typeof QRCode.toCanvas } = { toCanvas: QRCode.toCanvas }
+): Promise<void> {
+  if (frames.length === 0) {
+    throw new Error('Error: frame precompute failed: no frames to encode.');
+  }
+
+  const canvas = document.createElement('canvas');
+  try {
+    for (const frame of frames) {
+      await encodeFrameToCanvas(frame, canvas, options, deps);
+    }
+  } catch (error) {
+    const message = asErrorMessage(error, 'Unknown preflight failure.');
+    throw new Error(`Error: frame precompute failed: ${message}`);
   }
 }
 
