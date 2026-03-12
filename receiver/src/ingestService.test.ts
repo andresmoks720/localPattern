@@ -68,7 +68,7 @@ describe('ReceiverIngestService', () => {
     const diagnostics = service.getDiagnostics();
     expect(diagnostics.totalPayloadsSeen).toBe(6);
     expect(diagnostics.duplicateScannerPayloads).toBe(1);
-    expect(diagnostics.acceptedFrames).toBe(5);
+    expect(diagnostics.acceptedFrames).toBe(4);
     expect(events).toContain('duplicateScannerPayload');
   });
 
@@ -87,8 +87,70 @@ describe('ReceiverIngestService', () => {
 
     const diagnostics = service.getDiagnostics();
     expect(diagnostics.foreignTransferFrames).toBe(1);
-    expect(diagnostics.acceptedFrames).toBe(RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS + 1);
+    expect(diagnostics.acceptedFrames).toBe(RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS);
   });
+
+
+
+  it('drops replayed data sequence numbers for locked session and logs tuple metadata', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const dropped: string[] = [];
+    const accepted: string[] = [];
+    const service = new ReceiverIngestService({
+      machine,
+      scannerDedupeWindowMs: 0,
+      onEvent: (event) => {
+        if (event.type === 'frameDropped') dropped.push(`${event.reason}:${event.tuple.sessionId}:${event.tuple.streamId}:${event.tuple.seq}`);
+        if (event.type === 'frameAccepted') accepted.push(`${event.tuple.sessionId}:${event.tuple.streamId}:${event.tuple.seq}`);
+      }
+    });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
+    const headerPayload = assembleFrame(transfer.header);
+    ingestHeaderConfirmations(service, headerPayload, 1000);
+
+    const packet0 = transfer.dataFrames[0];
+    const replayedPacket0DifferentPayload: TransferDataFrame = {
+      ...packet0,
+      payload: transfer.dataFrames[1].payload.slice(),
+      payloadLen: transfer.dataFrames[1].payloadLen,
+      packetCrc32: calculateCRC32(Uint8Array.of(...packet0.transferId, ...new Uint8Array([(packet0.packetIndex >> 8) & 0xff, packet0.packetIndex & 0xff]), ...transfer.dataFrames[1].payload))
+    };
+
+    service.ingest(assembleFrame(packet0), 1010);
+    service.ingest(assembleFrame(replayedPacket0DifferentPayload), 1011);
+
+    expect(accepted).toContain(`${machine.snapshot.transferId}:DATA:0`);
+    expect(dropped.some((entry) => entry.includes('replayedSequence') && entry.endsWith(':DATA:0'))).toBe(true);
+  });
+
+  it('resets sequence tracking after a validated new session start lock', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const dropped: string[] = [];
+    const service = new ReceiverIngestService({
+      machine,
+      onEvent: (event) => {
+        if (event.type === 'frameDropped') dropped.push(event.reason);
+      }
+    });
+
+    const transferA = chunkFile(new Uint8Array([1, 2]), { fileName: 'a.bin', maxPayloadSize: 2, includeEndFrame: true });
+    ingestHeaderConfirmations(service, assembleFrame(transferA.header), 1000);
+    service.ingest(assembleFrame(transferA.dataFrames[0]), 1010);
+
+    machine.startScanning();
+    service.reset();
+
+    const transferB = chunkFile(new Uint8Array([9, 8]), { fileName: 'b.bin', maxPayloadSize: 2, includeEndFrame: true });
+    ingestHeaderConfirmations(service, assembleFrame(transferB.header), 2000);
+    service.ingest(assembleFrame(transferB.dataFrames[0]), 2010);
+
+    expect(machine.snapshot.receivedCount).toBe(1);
+    expect(dropped).not.toContain('replayedSequence');
+  });
+
 
   it('counts malformed/non-protocol payloads independently', () => {
     const machine = new ReceiverMachine();
