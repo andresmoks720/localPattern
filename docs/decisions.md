@@ -18,15 +18,15 @@
 - This keeps transport and protocol byte-oriented end-to-end for arbitrary binary file types without a text wrapper.
 
 ## Reliability Defaults
-- QR size is settings-driven via the sender slider (`200-600px`), with a default of `400px`; rendering forces high-contrast black-on-white colors (`#000000` on `#FFFFFF`) for decoder reliability.
-- QR error correction level defaults to `H`.
-- Frame duration defaults to `2000ms`: this trades speed for better decode reliability and gives slower cameras enough dwell time per frame.
+- QR rendering uses explicit high-contrast black-on-white colors (`#000000` on `#FFFFFF`) for decoder reliability.
+- Sender exposes tunable pacing / QR-size / chunking controls in UI; exact numeric defaults are intentionally code-owned to avoid docs drift.
 - Receiver decode loop is throttled to one decode attempt every `300ms` to reduce CPU load while preserving responsiveness.
 - Sender defaults to **stop at end** rather than looping, so users get a clear end-of-stream and ETA.
-- Effective throughput is primarily controlled by three settings together: `frameDurationMs`, effective chunk size (auto-estimated from QR size/error correction or manual chunk size), and `redundancyCount`.
-- Passive redundancy defaults to 3x per packet (`redundancyCount=3`) to improve scan reliability without introducing ACK/NACK complexity.
+- Sender keeps a dedicated **Clear QR** control as a persistent panel action (separate from full Reset) so operators can blank stale frames after stop/error without dropping the loaded file.
+- Effective throughput is primarily controlled by frame duration and effective chunk sizing.
 - Sender requests a screen wake lock during active transmission (when supported) to reduce screen dimming failures.
 - Receiver stats semantics: once issue #1 is fixed, receiver UI should consistently present **total scans** separately from **unique packets**.
 
 ### Canonical Defaults Source
-- Keep sender defaults documented from one canonical source: `sender/src/main.ts` `DEFAULT_SETTINGS`. Reference this object for README/agents/docs updates to avoid drift across files.
+- Keep numeric runtime defaults in code only (`sender/src/main.ts` `DEFAULT_SETTINGS` and related runtime guards).
+- Keep docs descriptive, not prescriptive: document control semantics and safety invariants, not exact numbers that can change between releases.

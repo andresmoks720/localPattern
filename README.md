@@ -26,14 +26,19 @@ npm run dev:receiver
 - V2 receivers reject V1 packets with `Version Mismatch`.
 - Upgrade sender and receiver together when moving to v2.0.0-beta.
 
-## Calibration Guide (Sender Settings)
-Defaults are tuned for reliability: **2000ms frame duration**, **H ECC**, **400px QR**, **3x redundancy**, **Auto chunk size**.
+## Documentation Policy (important)
+To prevent docs from blocking new functionality, this repo treats documentation as follows:
 
-- **Frame Duration (500–5000ms):** increase first if scans fail.
-- **QR Error Correction (L/M/Q/H):** keep `H` in noisy or dim environments.
-- **QR Size (200–600px):** increase for distance/low-quality camera.
-- **Chunk Size:** use Auto unless you need manual tuning.
-- **Redundancy:** repeats each packet (default 3x) to improve recovery without ACK/NACK.
+- **Runtime behavior source of truth:** implementation in `sender/src/main.ts`, `sender/src/transmissionService.ts`, `receiver/src/main.ts`, and `protocol/src/*`.
+- **README purpose:** operator guidance only (what buttons do, how to run, common recovery steps).
+- **No hardcoded tuning defaults in README/docs** unless they are generated from code in CI.
+- If docs and code disagree, **code wins** and docs should be updated in the same PR.
+
+## Calibration Guide (Sender Settings)
+- Start with current UI defaults.
+- If scanning fails repeatedly, increase frame duration first.
+- Increase QR size and keep higher error correction for low light / longer distance.
+- Use chunk auto-sizing unless troubleshooting a specific device pair.
 
 ## Receiver Guidance
 - Tap **Start Scan** (required by iOS Safari camera policy).
@@ -41,9 +46,14 @@ Defaults are tuned for reliability: **2000ms frame duration**, **H ECC**, **400p
 - If no packets arrive for 5s, app shows **Signal Lost - Check Alignment**.
 - Avoid minimizing tabs during transfer.
 
+## Sender Controls (operational)
+- **Stop:** halt countdown/streaming and keep the loaded file ready for resend.
+- **Clear QR:** clears the currently displayed QR frame while preserving the loaded file and transfer plan.
+- **Reset:** clears QR, loaded file, and sender state back to `No file selected`.
+
 ## Troubleshooting
 - **Scanning fails repeatedly:** increase Frame Duration (e.g., 2500–3000ms).
-- **Hash mismatch:** reduce chunk size or increase redundancy.
+- **Hash mismatch:** reduce chunk size and re-run with slower pacing.
 - **Camera unavailable:** verify browser permission settings, then refresh.
 - **Android says camera in use:** stop scan in app to release camera stream, then retry.
 
@@ -79,11 +89,8 @@ No data leaves your device through network transfer APIs. Transfers are line-of-
 - Long transfers can warm devices.
 - No retry handshake yet; restart sender/receiver on severe packet loss.
 
-## v1.0 Release Notes
-- Passive redundancy (default 3x packet repeats) added for higher real-world success.
-- Sender wake lock + visibility pause protection.
-- Receiver scan stats now show total scans vs unique packet count.
-- Theme toggle + optional audio feedback for transfer progress/completion.
+## Release Notes
+- See git history and PR titles for release-level behavior changes.
 
 ## Tech Stack
 - TypeScript (strict)

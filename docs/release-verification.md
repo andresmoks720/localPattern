@@ -35,7 +35,7 @@ This record tracks cross-browser and offline transfer verification for release r
 | ID | Scenario | Status | Mitigation |
 | --- | --- | --- | --- |
 | KL-01 | Low-light (<100 lux) + glossy screen reflections | **Intermittent failures** | Increase QR size to `500-600`, keep ECC `H`, raise frame duration to `3000ms`, reduce distance, add direct light source. |
-| KL-02 | Older iOS devices (A12-era camera sensors) on dense packets | **Higher packet miss rate** | Keep chunk size on `Auto`, keep redundancy at `3x` or increase to `4x`, avoid background app switching during scan. |
+| KL-02 | Older iOS devices (A12-era camera sensors) on dense packets | **Higher packet miss rate** | Keep chunk size on `Auto`, slow frame cadence, increase QR size, and avoid background app switching during scan. |
 | KL-03 | Long transfers with thermal throttling on mid-range Android | **Potential slowdown / frame drops** | Lower screen brightness slightly, keep device charging if possible, split files and keep each transfer <=1 MiB (MVPv2 sender hard limit). |
 | KL-04 | Receiver tab backgrounded during active scan | **Decode stalls** | Keep receiver tab foregrounded; restart scan session if packet cadence stalls for >10s. |
 
