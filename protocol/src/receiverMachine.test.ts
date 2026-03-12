@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { FRAME_TYPE_DATA, FRAME_TYPE_HEADER, PROTOCOL_ERROR_CODES, ProtocolError, assembleFrame, chunkFile, parseFrame, type TransferDataFrame, type TransferHeaderFrame } from './index';
-import { RECEIVER_ERROR_CODES, RECEIVER_TIMEOUTS, ReceiverMachine } from './receiverMachine';
+import { RECEIVER_ERROR_CODES, RECEIVER_STATE_TRANSITIONS, RECEIVER_TIMEOUTS, ReceiverMachine } from './receiverMachine';
 
 describe('receiver machine', () => {
   it('locks to first transferId and ignores other transfer data', () => {
@@ -108,6 +108,19 @@ describe('receiver machine', () => {
     expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.END_INCOMPLETE);
   });
 
+
+  it('non-empty success does not require END once full packet set verifies', () => {
+    const machine = new ReceiverMachine();
+    const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'no-end.bin', maxPayloadSize: 3, includeEndFrame: true });
+    machine.startScanning();
+
+    machine.applyFrame(transfer.header, 1);
+    const snapshot = machine.applyFrame(transfer.dataFrames[0], 2);
+
+    expect(snapshot.state).toBe('SUCCESS');
+    expect(snapshot.fileBytes).toEqual(new Uint8Array([1, 2, 3]));
+    expect(snapshot.endSeenAt).toBeNull();
+  });
   it('requires END for zero-byte success', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array(), { fileName: 'empty.bin', maxPayloadSize: 4, includeEndFrame: true });
@@ -261,6 +274,67 @@ describe('receiver machine', () => {
     expect(snapshot.transferId).toBeNull();
   });
 
+
+  it('terminal ERROR blocks further frames across multiple error classes', () => {
+    const baseTransfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'err.bin', maxPayloadSize: 2, includeEndFrame: true });
+
+    const scenarios: Array<{ name: string; trigger(machine: ReceiverMachine): void }> = [
+      {
+        name: 'HEADER_CONFLICT',
+        trigger: (machine) => {
+          machine.applyFrame(baseTransfer.header, 1);
+          machine.applyFrame({ ...baseTransfer.header, totalPackets: baseTransfer.header.totalPackets + 1 }, 2);
+        }
+      },
+      {
+        name: 'FILE_CRC_MISMATCH',
+        trigger: (machine) => {
+          machine.applyFrame({ ...baseTransfer.header, fileCrc32: (baseTransfer.header.fileCrc32 + 1) >>> 0 }, 1);
+          machine.applyFrame(baseTransfer.dataFrames[0], 2);
+          machine.applyFrame(baseTransfer.dataFrames[1], 3);
+        }
+      },
+      {
+        name: 'FILE_SIZE_MISMATCH',
+        trigger: (machine) => {
+          machine.applyFrame({ ...baseTransfer.header, fileSize: baseTransfer.header.fileSize + 2 }, 1);
+          machine.applyFrame(baseTransfer.dataFrames[0], 2);
+          machine.applyFrame(baseTransfer.dataFrames[1], 3);
+        }
+      },
+      {
+        name: 'END_INCOMPLETE',
+        trigger: (machine) => {
+          machine.applyFrame(baseTransfer.header, 1);
+          machine.applyFrame(baseTransfer.dataFrames[0], 2);
+          machine.applyFrame(baseTransfer.endFrame!, 3);
+          machine.tick(3 + RECEIVER_TIMEOUTS.END_GRACE_MS + 1);
+        }
+      },
+      {
+        name: 'NO_PROGRESS_TIMEOUT',
+        trigger: (machine) => {
+          machine.applyFrame(baseTransfer.header, 1);
+          machine.applyFrame(baseTransfer.dataFrames[0], 2);
+          machine.tick(2 + RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + 1);
+        }
+      }
+    ];
+
+    for (const scenario of scenarios) {
+      const machine = new ReceiverMachine();
+      machine.startScanning();
+      scenario.trigger(machine);
+      expect(machine.snapshot.state, scenario.name).toBe('ERROR');
+
+      const transfer = chunkFile(new Uint8Array([7, 8]), { fileName: 'later.bin', maxPayloadSize: 2, includeEndFrame: true });
+      const totalBefore = machine.snapshot.totalScans;
+      const after = machine.applyFrame(transfer.header, 99);
+      expect(after.state, `${scenario.name}-post`).toBe('ERROR');
+      expect(after.totalScans, `${scenario.name}-scan-count`).toBe(totalBefore);
+    }
+  });
+
   it('terminal ERROR blocks further ingestion', () => {
     const machine = new ReceiverMachine();
     machine.startScanning();
@@ -292,4 +366,35 @@ describe('receiver machine', () => {
     expect(snapshot.fileBytes).toEqual(bytes);
   });
 
+
+  it('exposes explicit receiver transition map', () => {
+    expect(RECEIVER_STATE_TRANSITIONS.IDLE).toContain('SCANNING');
+    expect(RECEIVER_STATE_TRANSITIONS.VERIFYING).toContain('SUCCESS');
+    expect(RECEIVER_STATE_TRANSITIONS.ERROR).toContain('IDLE');
+  });
+
+  it('reset transitions to fresh IDLE state after terminal outcomes', () => {
+    const machine = new ReceiverMachine();
+    const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'fresh.bin', maxPayloadSize: 2, includeEndFrame: true });
+
+    machine.startScanning();
+    machine.applyFrame(transfer.header, 1);
+    machine.applyFrame(transfer.dataFrames[0], 2);
+    const success = machine.applyFrame(transfer.dataFrames[1], 3);
+    expect(success.state).toBe('SUCCESS');
+
+    machine.reset();
+    expect(machine.snapshot.state).toBe('IDLE');
+    expect(machine.snapshot.transferId).toBeNull();
+    expect(machine.snapshot.receivedCount).toBe(0);
+
+    machine.startScanning();
+    machine.applyFrame(transfer.header, 10);
+    machine.applyFrame({ ...transfer.header, fileName: 'conflict.bin' }, 11);
+    expect(machine.snapshot.state).toBe('ERROR');
+
+    machine.reset();
+    expect(machine.snapshot.state).toBe('IDLE');
+    expect(machine.snapshot.error).toBeUndefined();
+  });
 });

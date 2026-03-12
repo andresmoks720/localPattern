@@ -1,13 +1,12 @@
 import './style.css';
 import jsQR from 'jsqr';
 import {
-  parseFrame,
   ReceiverMachine,
   RECEIVER_ERROR_CODES,
   type ReceiverSnapshot
 } from '@qr-data-bridge/protocol';
+import { ReceiverIngestService } from './ingestService';
 
-const QR_PREFIX = 'QDB64:';
 const SCAN_INTERVAL_MS = 300;
 const SIGNAL_LOST_MS = 5000;
 const THEME_KEY = 'qdb_theme';
@@ -23,12 +22,6 @@ const logger = {
 
 let sharedAudioContext: AudioContext | null = null;
 
-function base64ToBytes(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
 
 function getElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -84,6 +77,7 @@ app.innerHTML = `
       <button id="scan-btn" type="button">Start Scan</button>
       <button id="theme-btn" type="button">Theme</button>
     </div>
+    <label class="inline-check">Camera: <select id="camera-select"><option value="">Auto (rear)</option></select></label>
     <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Completion sound</label>
     <div id="status" class="status">Ready to scan</div>
     <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
@@ -92,7 +86,7 @@ app.innerHTML = `
     <div id="last-received-time">Last packet: -</div>
     <div id="warning" class="warning"></div>
     <button id="download-btn" type="button" disabled>Download File</button>
-    <div class="hint">Tap Start Scan (required on iOS), keep brightness high on sender, and do not minimize this tab.</div>
+    <div class="hint">Tap Start Scan (required on iOS). Keep QR fully visible, hold both devices steady, move closer if scans fail, use fullscreen, and remember larger files are slower.</div>
     <div id="last-packet"></div>
   </aside>
 </main>`;
@@ -110,6 +104,7 @@ const downloadButton = getElement<HTMLButtonElement>('#download-btn');
 const lastReceivedTimeEl = getElement<HTMLDivElement>('#last-received-time');
 const themeButton = getElement<HTMLButtonElement>('#theme-btn');
 const soundEnabledInput = getElement<HTMLInputElement>('#sound-enabled');
+const cameraSelect = getElement<HTMLSelectElement>('#camera-select');
 
 const frameCanvas = document.createElement('canvas');
 const frameContextCandidate = frameCanvas.getContext('2d', { willReadFrequently: true });
@@ -119,15 +114,25 @@ const frameContext = frameContextCandidate;
 let rafId = 0;
 let monitorInterval: number | null = null;
 let activeStream: MediaStream | null = null;
-let lastDecodedPayload = '';
 let lastScanAt = 0;
 let scanStartedAt = 0;
 let lastPacketAt = 0;
 let downloadUrl: string | null = null;
 let soundEnabled = false;
 let successSoundPlayed = false;
+let ingestDecodeError: string | null = null;
+let selectedCameraId = '';
 
 const receiverMachine = new ReceiverMachine();
+const receiverIngest = new ReceiverIngestService({
+  machine: receiverMachine,
+  onEvent: (event) => {
+    if (event.type === 'decodeError') {
+      ingestDecodeError = event.message;
+      logger.error('[receiver] packet validation failed', event.message);
+    }
+  }
+});
 
 function setTheme(theme: 'dark' | 'light'): void {
   document.documentElement.dataset.theme = theme;
@@ -180,7 +185,8 @@ function updateProgress(snapshot: ReceiverSnapshot): void {
     progressText.textContent = `Receiving packets: ${received}/${total} (${pct}%)`;
   }
 
-  scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets`;
+  const diagnostics = receiverIngest.getDiagnostics();
+  scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets • dup:${diagnostics.duplicateScannerPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads}`;
 }
 
 function setStage(state: ReceiverSnapshot['state'], label: string): void {
@@ -246,11 +252,14 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
     return;
   }
 
-  setStage('ERROR', snapshot.error?.code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH ? 'Decode error' : 'Transfer incomplete, restart sender');
-  if (snapshot.error?.code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
+  const code = snapshot.error?.code;
+  setStage('ERROR', code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH ? 'Decode error' : 'Transfer incomplete, restart sender');
+  if (code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
     warningEl.textContent = 'Corruption error: file CRC32 mismatch detected. Retry with slower frame rate.';
+  } else if (code === RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT || code === RECEIVER_ERROR_CODES.END_INCOMPLETE) {
+    warningEl.textContent = 'Transfer incomplete, restart sender.';
   } else {
-    warningEl.textContent = snapshot.error?.message ?? 'Transfer incomplete, restart sender';
+    warningEl.textContent = snapshot.error?.message ?? 'Transfer incomplete, restart sender.';
   }
   stopScanLoop(true);
   scanButton.textContent = 'Restart Scan';
@@ -258,9 +267,11 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
 
 function resetUiForNewScan(): void {
   receiverMachine.startScanning();
+  receiverIngest.reset();
   revokeDownloadUrl();
   downloadButton.disabled = true;
   warningEl.textContent = '';
+  ingestDecodeError = null;
   successSoundPlayed = false;
   lastPacketEl.textContent = '';
   lastPacketAt = 0;
@@ -286,19 +297,16 @@ function processFrame(now: number): void {
   const image = frameContext.getImageData(0, 0, frameCanvas.width, frameCanvas.height);
   const result = jsQR(image.data, image.width, image.height);
 
-  if (result?.data && result.data.startsWith(QR_PREFIX) && result.data !== lastDecodedPayload) {
-    lastDecodedPayload = result.data;
-    try {
-      const frame = parseFrame(base64ToBytes(result.data.slice(QR_PREFIX.length)));
-      const snapshot = receiverMachine.applyFrame(frame, Date.now());
-      applySnapshot(snapshot);
-      lastPacketAt = Date.now();
-      lastReceivedTimeEl.textContent = `Last packet: ${new Date(lastPacketAt).toLocaleTimeString()}`;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown packet decode error.';
-      logger.error('[receiver] packet validation failed', message);
-      warningEl.textContent = `Decode error: ${message}`;
-    }
+  if (result?.binaryData?.length) {
+    void receiverIngest.enqueue(Uint8Array.from(result.binaryData), Date.now()).then((snapshot) => {
+      if (snapshot) {
+        applySnapshot(snapshot);
+        lastPacketAt = Date.now();
+        lastReceivedTimeEl.textContent = `Last packet: ${new Date(lastPacketAt).toLocaleTimeString()}`;
+      } else if (ingestDecodeError) {
+        warningEl.textContent = `Decode error: ${ingestDecodeError}`;
+      }
+    });
   }
 
   rafId = requestAnimationFrame(processFrame);
@@ -317,16 +325,65 @@ function updateSignalHealth(): void {
   }
 }
 
+
+async function populateCameraOptions(): Promise<void> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cameras = devices.filter((device) => device.kind === 'videoinput');
+    cameraSelect.innerHTML = '<option value="">Auto (rear)</option>' + cameras.map((camera, index) => (
+      `<option value="${camera.deviceId}">${camera.label || `Camera ${index + 1}`}</option>`
+    )).join('');
+  } catch (error) {
+    logger.error('Failed to enumerate cameras', error);
+  }
+}
+
+function waitForVideoReady(timeoutMs = 2000): Promise<void> {
+  return new Promise((resolve) => {
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      resolve();
+      return;
+    }
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      video.removeEventListener('loadedmetadata', onReady);
+      video.removeEventListener('canplay', onReady);
+      window.clearTimeout(timer);
+    };
+    video.addEventListener('loadedmetadata', onReady, { once: true });
+    video.addEventListener('canplay', onReady, { once: true });
+    const timer = window.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, timeoutMs);
+  });
+}
+
 async function startScan(): Promise<void> {
   resetUiForNewScan();
   setStage('SCANNING', 'Initializing Camera...');
 
   try {
-    activeStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    const preferredConstraints: MediaStreamConstraints = selectedCameraId
+      ? { video: { deviceId: { exact: selectedCameraId } }, audio: false }
+      : { video: { facingMode: 'environment' }, audio: false };
+
+    try {
+      activeStream = await navigator.mediaDevices.getUserMedia(preferredConstraints);
+    } catch (preferredError) {
+      logger.error('Preferred camera request failed, falling back', preferredError);
+      warningEl.textContent = 'Preferred camera unavailable; using fallback camera.';
+      activeStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }
+
     video.srcObject = activeStream;
+    await waitForVideoReady();
     await video.play();
+    await populateCameraOptions();
     setStage('SCANNING', 'Waiting for header');
-    lastDecodedPayload = '';
     lastScanAt = 0;
     scanStartedAt = Date.now();
     scanButton.textContent = 'Stop Scan';
@@ -355,6 +412,10 @@ soundEnabledInput.addEventListener('change', () => {
   void resumeAudioContext();
 });
 
+cameraSelect.addEventListener('change', () => {
+  selectedCameraId = cameraSelect.value;
+});
+
 themeButton.addEventListener('click', () => {
   const current = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
   setTheme(current === 'dark' ? 'light' : 'dark');
@@ -374,3 +435,4 @@ window.addEventListener('beforeunload', () => {
 setTheme(localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark');
 receiverMachine.reset();
 applySnapshot(receiverMachine.snapshot);
+void populateCameraOptions();
