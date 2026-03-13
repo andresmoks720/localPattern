@@ -144,39 +144,37 @@ app.innerHTML = `
     </div>
   </section>
   <aside class="panel">
-    <div class="panel-grid">
-      <div class="controls-grid">
-        <div class="row">
-          <button id="theme-btn" type="button">Theme</button>
-          <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Sound</label>
-        </div>
-        <input id="file-input" type="file" />
-        <details>
-      <summary>Settings</summary>
-      <label>Frame Duration: <span id="frame-duration-label"></span>
-        <input id="frame-duration" type="range" min="500" max="5000" step="100" />
-      </label>
-      <label>QR Error Correction
-        <select id="error-correction"><option value="L">L</option><option value="M">M</option><option value="Q">Q</option><option value="H">H</option></select>
-      </label>
-      <label>QR Size: <span id="qr-size-label"></span>
-        <input id="qr-size" type="range" min="200" max="1000" step="20" />
-      </label>
-      <label><input id="chunk-auto" type="checkbox" /> Auto Chunk Size</label>
-      <label>Chunk Size: <span id="chunk-size-label"></span>
-        <input id="chunk-size" type="range" min="128" max="1024" step="16" />
-      </label>
-      <label>Redundancy: <span id="redundancy-label"></span>
-        <input id="redundancy" type="range" min="1" max="5" step="1" />
-      </label>
-    </details>
+    <div class="button-pack">
+      <button id="start-btn" type="button" disabled>Start Transmission</button>
+      <button id="stop-btn" type="button" disabled>Stop</button>
+      <button id="clear-btn" type="button" data-persistent-control="true">Clear QR</button>
+      <button id="reset-btn" type="button">Reset</button>
+    </div>
+    <div class="controls-grid">
+      <div class="row">
+        <button id="theme-btn" type="button">Theme</button>
+        <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Sound</label>
       </div>
-      <div class="button-pack">
-        <button id="start-btn" type="button" disabled>Start Transmission</button>
-        <button id="stop-btn" type="button" disabled>Stop</button>
-        <button id="clear-btn" type="button" data-persistent-control="true">Clear QR</button>
-        <button id="reset-btn" type="button">Reset</button>
-      </div>
+      <input id="file-input" type="file" />
+      <details>
+    <summary>Settings</summary>
+    <label>Frame Duration: <span id="frame-duration-label"></span>
+      <input id="frame-duration" type="range" min="500" max="5000" step="100" />
+    </label>
+    <label>QR Error Correction
+      <select id="error-correction"><option value="L">L</option><option value="M">M</option><option value="Q">Q</option><option value="H">H</option></select>
+    </label>
+    <label>QR Size: <span id="qr-size-label"></span>
+      <input id="qr-size" type="range" min="200" max="1000" step="20" />
+    </label>
+    <label><input id="chunk-auto" type="checkbox" /> Auto Chunk Size</label>
+    <label>Chunk Size: <span id="chunk-size-label"></span>
+      <input id="chunk-size" type="range" min="128" max="1024" step="16" />
+    </label>
+    <label>Redundancy: <span id="redundancy-label"></span>
+      <input id="redundancy" type="range" min="1" max="5" step="1" />
+    </label>
+  </details>
     </div>
     <div id="file-meta">No file selected.</div>
     <div id="packet-meta">Packet: -</div>
