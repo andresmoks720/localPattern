@@ -170,6 +170,12 @@ const decodePipeline = new DecodePipeline(frameDecoder, {
 let rafId = 0;
 let monitorInterval: number | null = null;
 let activeStream: MediaStream | null = null;
+let activeVideoTrack: MediaStreamTrack | null = null;
+let activeVideoTrackListeners: {
+  mute: () => void;
+  unmute: () => void;
+  ended: () => void;
+} | null = null;
 let lastScanAt = 0;
 let scanStartedAt = 0;
 let lastDiscoveryActivityAt = 0;
@@ -475,6 +481,36 @@ function appendDebugEvent(message: string, force = false): void {
   }
 }
 
+function appendTrackEvent(message: string, track: MediaStreamTrack, force = false): void {
+  appendDebugEvent(`${message} enabled=${track.enabled} muted=${track.muted} readyState=${track.readyState}`, force);
+}
+
+function detachActiveVideoTrackListeners(): void {
+  if (!activeVideoTrack || !activeVideoTrackListeners) return;
+  activeVideoTrack.removeEventListener('mute', activeVideoTrackListeners.mute);
+  activeVideoTrack.removeEventListener('unmute', activeVideoTrackListeners.unmute);
+  activeVideoTrack.removeEventListener('ended', activeVideoTrackListeners.ended);
+  activeVideoTrackListeners = null;
+  activeVideoTrack = null;
+}
+
+function attachVideoTrackLifecycleListeners(track: MediaStreamTrack): void {
+  detachActiveVideoTrackListeners();
+  const listeners = {
+    mute: () => appendTrackEvent('Receiver camera track muted.', track, true),
+    unmute: () => appendTrackEvent('Receiver camera track unmuted.', track, true),
+    ended: () => {
+      appendTrackEvent('Receiver camera track ended.', track, true);
+      warningEl.textContent = 'Camera track ended unexpectedly. Restart scan.';
+    }
+  };
+  track.addEventListener('mute', listeners.mute);
+  track.addEventListener('unmute', listeners.unmute);
+  track.addEventListener('ended', listeners.ended);
+  activeVideoTrack = track;
+  activeVideoTrackListeners = listeners;
+}
+
 
 function logGapEvent(event: {
   type: 'gap_detected' | 'gap_filled' | 'gap_lost';
@@ -579,6 +615,7 @@ function revokeDownloadUrl(): void {
 }
 
 function stopCameraStream(): void {
+  detachActiveVideoTrackListeners();
   activeStream?.getTracks().forEach((track) => track.stop());
   activeStream = null;
   video.srcObject = null;
@@ -1136,6 +1173,19 @@ async function startScan(): Promise<void> {
       warningEl.textContent = 'Preferred camera unavailable; using fallback camera.';
       activeStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
     }
+
+    const track = activeStream.getVideoTracks()[0];
+    if (!track) {
+      throw new Error('No camera track available');
+    }
+    if (track.readyState !== 'live') {
+      throw new Error(`Camera track is not live (readyState=${track.readyState})`);
+    }
+
+    appendTrackEvent(`Receiver camera track acquired. label=${track.label}`, track, true);
+    appendDebugEvent(`Receiver camera track settings=${JSON.stringify(track.getSettings?.() ?? null)}`, true);
+    appendDebugEvent(`Receiver camera track constraints=${JSON.stringify(track.getConstraints?.() ?? null)}`, true);
+    attachVideoTrackLifecycleListeners(track);
 
     video.srcObject = activeStream;
     await waitForVideoReady();
