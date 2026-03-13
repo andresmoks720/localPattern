@@ -237,6 +237,7 @@ export class ReceiverMachine {
 
     if (
       this.snapshotValue.lockConfirmed
+      && this.snapshotValue.endSeenAt === null
       && this.snapshotValue.lastUniquePacketAt !== null
       && now - this.snapshotValue.lastUniquePacketAt > RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS
       && (
@@ -244,7 +245,7 @@ export class ReceiverMachine {
         || now - this.snapshotValue.lastMatchingFrameAt > RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
       )
     ) {
-      return this.fail(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT, 'No new unique packets for 15 seconds after transfer lock.');
+      return this.fail(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT, 'No new unique packets for 15 seconds after transfer lock (before END is observed).');
     }
 
     if (

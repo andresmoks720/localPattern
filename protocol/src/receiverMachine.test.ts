@@ -254,6 +254,27 @@ describe('receiver machine', () => {
     expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.END_INCOMPLETE);
   });
 
+  it('prefers END_INCOMPLETE over no-progress timeout after END is observed', () => {
+    const machine = new ReceiverMachine();
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4, 5, 6]), { fileName: 'end-priority.bin', maxPayloadSize: 2, includeEndFrame: true });
+    machine.startScanning();
+
+    confirmHeaderLock(machine, transfer.header, 1_000);
+    machine.applyFrame(transfer.dataFrames[0], 1_010);
+    machine.applyFrame(transfer.endFrame!, 1_020);
+
+    const expiredNow = 1_020
+      + RECEIVER_TIMEOUTS.END_GRACE_MS
+      + RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
+      + RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS
+      + 1;
+    const snapshot = machine.tick(expiredNow);
+
+    expect(snapshot.state).toBe('ERROR');
+    expect(snapshot.error?.code).toBe(RECEIVER_ERROR_CODES.END_INCOMPLETE);
+    expect(snapshot.error?.message).toContain('END frame seen before all packets were received');
+  });
+
 
   it('non-empty success does not require END once full packet set verifies', () => {
     const machine = new ReceiverMachine();
