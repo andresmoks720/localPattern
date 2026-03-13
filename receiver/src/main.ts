@@ -33,8 +33,8 @@ const ROI_PADDING_RATIO = 0.4;
 const ROI_MISSES_BEFORE_FULL = 3;
 const FORCE_FULL_EVERY_ATTEMPTS = 10;
 const ROI_NO_SUCCESS_RESET_MS = 1000;
-const MAX_FULL_DECODE_SIDE_PX = 512;
-const MAX_ROI_DECODE_SIDE_PX = 640;
+const MAX_FULL_DECODE_SIDE_PX = 448;
+const MAX_ROI_DECODE_SIDE_PX = 448;
 
 const logger = {
   debug: (...args: unknown[]) => {
@@ -898,7 +898,7 @@ function processFrame(now: number): void {
     return;
   }
 
-  const scanIntervalMs = selectScanIntervalMs(receiverMachine.snapshot.lockConfirmed);
+  const scanIntervalMs = selectScanIntervalMs(receiverMachine.snapshot.lockConfirmed, receiverMachine.snapshot.receivedCount > 0);
   if (now - lastScanAt < scanIntervalMs) {
     scanLoopDiagnostics.throttledTicks += 1;
     rafId = requestAnimationFrame(processFrame);

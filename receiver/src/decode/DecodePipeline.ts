@@ -87,10 +87,16 @@ export class DecodePipeline {
 
   private countersValue: DecodePipelineCounters = createEmptyCounters();
 
+  private readonly normalizedConfig: DecodePipelineConfig;
+
   public constructor(
     private readonly decoder: ReceiverFrameDecoder,
     private readonly config: DecodePipelineConfig
   ) {
+    this.normalizedConfig = {
+      ...config,
+      maxRoiSidePx: Math.min(config.maxRoiSidePx, config.maxFullSidePx)
+    };
     const context = this.scratchCanvas.getContext('2d', { willReadFrequently: true });
     if (!context) {
       throw new Error('Failed to initialize decode scratch context.');
@@ -118,17 +124,17 @@ export class DecodePipeline {
 
   public getMode(lockConfirmed: boolean, nowMs: number): DecodeMode {
     if (!lockConfirmed || !this.roiBox) return 'full';
-    if (this.lastSuccessAtMs !== null && (nowMs - this.lastSuccessAtMs) > this.config.noSuccessResetMs) {
+    if (this.lastSuccessAtMs !== null && (nowMs - this.lastSuccessAtMs) > this.normalizedConfig.noSuccessResetMs) {
       this.countersValue.forcedFullFallbacks += 1;
       this.clearRoi();
       return 'full';
     }
-    if (this.consecutiveRoiMisses >= this.config.roiMissesBeforeFull) {
+    if (this.consecutiveRoiMisses >= this.normalizedConfig.roiMissesBeforeFull) {
       this.countersValue.forcedFullFallbacks += 1;
-      this.attemptsSinceLastFull = this.config.forceFullEveryAttempts;
+      this.attemptsSinceLastFull = this.normalizedConfig.forceFullEveryAttempts;
       return 'full';
     }
-    if (this.attemptsSinceLastFull >= Math.max(1, this.config.forceFullEveryAttempts) - 1) {
+    if (this.attemptsSinceLastFull >= Math.max(1, this.normalizedConfig.forceFullEveryAttempts) - 1) {
       this.countersValue.forcedFullFallbacks += 1;
       return 'full';
     }
@@ -146,7 +152,7 @@ export class DecodePipeline {
     const sourceRegion = mode === 'roi' && this.roiBox
       ? this.clampBox(this.roiBox, frameWidth, frameHeight)
       : { x: 0, y: 0, width: frameWidth, height: frameHeight };
-    const maxSide = mode === 'roi' ? this.config.maxRoiSidePx : this.config.maxFullSidePx;
+    const maxSide = mode === 'roi' ? this.normalizedConfig.maxRoiSidePx : this.normalizedConfig.maxFullSidePx;
     const scale = sourceRegion.width > 0 && sourceRegion.height > 0
       ? Math.min(1, maxSide / Math.max(sourceRegion.width, sourceRegion.height))
       : 1;
@@ -270,8 +276,8 @@ export class DecodePipeline {
     const maxY = Math.max(...mapped.map((point) => point.y));
     const width = Math.max(1, maxX - minX);
     const height = Math.max(1, maxY - minY);
-    const padX = width * this.config.roiPaddingRatio;
-    const padY = height * this.config.roiPaddingRatio;
+    const padX = width * this.normalizedConfig.roiPaddingRatio;
+    const padY = height * this.normalizedConfig.roiPaddingRatio;
     return this.clampBox(
       {
         x: minX - padX,

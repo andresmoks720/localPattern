@@ -146,6 +146,20 @@ describe('DecodePipeline', () => {
 
 
 
+
+  it('caps ROI decode side to full decode side when configured larger', () => {
+    const decoder = new ScriptedDecoder([withGeometry, null]);
+    const pipeline = new DecodePipeline(decoder, config({ maxFullSidePx: 320, maxRoiSidePx: 640 }));
+    const canvas = createFakeCanvas(1280, 720);
+
+    const first = pipeline.decode(canvas as unknown as HTMLCanvasElement, 1280, 720, true, 0);
+    accept(pipeline, first.trackingHint, 0, null, 'a');
+
+    const roi = pipeline.decode(canvas as unknown as HTMLCanvasElement, 1280, 720, true, 20);
+    expect(roi.mode).toBe('roi');
+    expect(Math.max(roi.inputWidth, roi.inputHeight)).toBeLessThanOrEqual(320);
+  });
+
   it('forces periodic full-frame decode while ROI mode is active', () => {
     const decoder = new ScriptedDecoder([withGeometry, null, null, null]);
     const pipeline = new DecodePipeline(decoder, config({ forceFullEveryAttempts: 2, roiMissesBeforeFull: 99 }));
