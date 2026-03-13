@@ -7,7 +7,8 @@ const pagesDist = resolve(root, '.pages-dist');
 const requiredFiles = [
   resolve(pagesDist, 'index.html'),
   resolve(pagesDist, 'sender/index.html'),
-  resolve(pagesDist, 'receiver/index.html')
+  resolve(pagesDist, 'receiver/index.html'),
+  resolve(pagesDist, 'receiver_video/index.html')
 ];
 
 const devOnlyPathPatterns = [

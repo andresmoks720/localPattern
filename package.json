@@ -5,7 +5,8 @@
   "workspaces": [
     "protocol",
     "sender",
-    "receiver"
+    "receiver",
+    "receiver_video"
   ],
   "scripts": {
     "build": "npm run build --workspaces",
@@ -13,7 +14,7 @@
     "dev:receiver": "npm run dev -w receiver",
     "typecheck": "npm run typecheck --workspaces",
     "size:check": "npm run build --workspaces",
-    "build:all": "npm run build -w protocol && npm run build -w sender && npm run build -w receiver",
+    "build:all": "npm run build -w protocol && npm run build -w sender && npm run build -w receiver && npm run build -w receiver_video",
     "build:pages": "npm run build:all && node scripts/build-pages.mjs && npm run verify:pages",
     "ci:check-focused-tests": "node scripts/ci-hygiene.mjs",
     "ci:test": "npm run ci:check-focused-tests && NODE_OPTIONS=--unhandled-rejections=strict npm run test -w protocol && NODE_OPTIONS=--unhandled-rejections=strict npm run test -w sender && NODE_OPTIONS=--unhandled-rejections=strict npm run test -w receiver",

@@ -1,0 +1,16 @@
+{
+  "name": "receiver_video",
+  "version": "2.0.0-beta",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5175",
+    "build": "vite build",
+    "preview": "vite preview --port 4175",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@qr-data-bridge/protocol": "*",
+    "jsqr": "^1.4.0"
+  }
+}
