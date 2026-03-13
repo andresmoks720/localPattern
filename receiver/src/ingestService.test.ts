@@ -421,3 +421,41 @@ describe('ReceiverIngestService', () => {
   });
 
 });
+
+it('keeps ingest timing metrics bounded during long sessions', async () => {
+  const machine = new ReceiverMachine();
+  machine.startScanning();
+  const service = new ReceiverIngestService({ machine });
+
+  const transfer = chunkFile(new Uint8Array(Array.from({ length: 64 }, (_, i) => i + 1)), {
+    fileName: 'timings.bin',
+    maxPayloadSize: 4,
+    includeEndFrame: true
+  });
+
+  const headerPayload = assembleFrame(transfer.header);
+  for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS; i += 1) {
+    await service.enqueue(headerPayload, 1000 + i);
+  }
+
+  let now = 2000;
+  for (let i = 0; i < 800; i += 1) {
+    const frame = transfer.dataFrames[i % transfer.dataFrames.length];
+    await service.enqueue(assembleFrame(frame), now);
+    now += 1;
+  }
+
+  const internal = service as unknown as {
+    queueWaitSamples: { size: () => number };
+    ingestDurationSamples: { size: () => number };
+  };
+
+  expect(internal.queueWaitSamples.size()).toBeLessThanOrEqual(256);
+  expect(internal.ingestDurationSamples.size()).toBeLessThanOrEqual(256);
+
+  const diagnostics = service.getDiagnostics();
+  expect(diagnostics.queueWaitAvgMs).toBeGreaterThanOrEqual(0);
+  expect(diagnostics.queueWaitP95Ms).toBeGreaterThanOrEqual(0);
+  expect(diagnostics.ingestDurationAvgMs).toBeGreaterThanOrEqual(0);
+  expect(diagnostics.ingestDurationP95Ms).toBeGreaterThanOrEqual(0);
+});
