@@ -138,7 +138,7 @@ describe('ReceiverIngestService', () => {
       machine,
       scannerDedupeWindowMs: 0,
       onEvent: (event) => {
-        if (event.type === 'frameDropped') dropped.push(`${event.reason}:${event.tuple.sessionId}:${event.tuple.streamId}:${event.tuple.seq}`);
+        if (event.type === 'frameDropped' && event.tuple) dropped.push(`${event.reason}:${event.tuple.sessionId}:${event.tuple.streamId}:${event.tuple.seq}`);
         if (event.type === 'frameAccepted') accepted.push(`${event.tuple.sessionId}:${event.tuple.streamId}:${event.tuple.seq}`);
       }
     });

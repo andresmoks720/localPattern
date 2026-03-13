@@ -201,11 +201,35 @@ describe('receiver machine', () => {
     expect(snapshot.endSeenAt).toBeNull();
   });
 
+
+  it('cannot trigger locked-transfer signal loss before header lock', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+
+    const preLockSnapshot = machine.tick(Date.now() + RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS + 5000);
+    expect(preLockSnapshot.state).toBe('SCANNING');
+    expect(preLockSnapshot.error).toBeUndefined();
+  });
+
+  it('does not fail incomplete transfer before valid HEADER lock', () => {
+    const machine = new ReceiverMachine();
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'prelock.bin', maxPayloadSize: 2, includeEndFrame: true });
+    machine.startScanning();
+
+    machine.applyFrame(transfer.endFrame!, 10);
+    const snapshot = machine.tick(10 + RECEIVER_TIMEOUTS.END_GRACE_MS + RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS + 1);
+
+    expect(snapshot.state).toBe('SCANNING');
+    expect(snapshot.error).toBeUndefined();
+  });
+
   it('does not trigger no-progress timeout before first unique packet', () => {
     const machine = new ReceiverMachine();
     const transfer = chunkFile(new Uint8Array([1, 2, 3]), { fileName: 'zero-time.bin', maxPayloadSize: 2, includeEndFrame: true });
     machine.startScanning();
     confirmHeaderLock(machine, transfer.header, 0);
+    expect(machine.snapshot.headerLockedAt).toBe(2);
+    expect(machine.snapshot.lastMatchingFrameAt).toBe(2);
 
     const stillReceiving = machine.tick(RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS + RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS);
     expect(stillReceiving.state).toBe('RECEIVING');

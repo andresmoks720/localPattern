@@ -7,6 +7,9 @@ import {
   RECEIVER_LOCK_CONFIRMATION,
   RECEIVER_TIMEOUTS,
   parseFrame,
+  FRAME_TYPE_HEADER,
+  FRAME_TYPE_DATA,
+  FRAME_TYPE_END,
   type ReceiverSnapshot
 } from '@qr-data-bridge/protocol';
 import { ReceiverIngestService } from './ingestService';
@@ -20,6 +23,7 @@ const MAX_CENTER_DRIFT_RATIO = 0.12;
 const STABLE_SCANS_REQUIRED = 2;
 const THEME_KEY = 'qdb_theme';
 const DEBUG_EVENT_LOG_CAP = 100;
+const RECEIVER_LOG_CACHE_KEY = 'receiver_log_cache';
 const SCAN_LOOP_LAG_THRESHOLD_MS = 500;
 const SLOW_QR_DECODE_THRESHOLD_MS = 120;
 
@@ -89,16 +93,17 @@ app.innerHTML = `
       <div class="side-buttons">
         <button id="scan-btn" type="button">Start Scan</button>
         <button id="download-btn" type="button" disabled>Download File</button>
-        <button id="copy-events-btn" type="button">Copy Event Timeline</button>
+        <button id="pause-session-btn" type="button">Pause Session</button>
+        <button id="copy-events-btn" type="button">Copy Logs to Cache</button>
         <button id="theme-btn" type="button">Theme</button>
       </div>
       <div class="panel-content">
         <label class="inline-check">Camera: <select id="camera-select"><option value="">Auto (rear)</option></select></label>
         <label class="inline-check"><input id="sound-enabled" type="checkbox"/> Completion sound</label>
         <div id="status" class="status">Ready to scan</div>
-        <div id="lock-status">Searching for start frame...</div>
+        <div id="lock-status">Waiting for initial QR</div>
         <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
-        <div id="progress-text">Waiting for header</div>
+        <div id="progress-text">Searching for transfer header</div>
         <div id="scan-stats">Received 0 scans → 0 unique packets</div>
         <div id="diagnostic-hint">Diagnostics: waiting for scan data.</div>
         <div id="progress-health">Progress health: waiting for first frame…</div>
@@ -136,6 +141,7 @@ const cameraSelect = getElement<HTMLSelectElement>('#camera-select');
 const debugLogEnabledInput = getElement<HTMLInputElement>('#debug-log-enabled');
 const debugLogPanel = getElement<HTMLDetailsElement>('#debug-log-panel');
 const debugLogOutput = getElement<HTMLPreElement>('#debug-log-output');
+const pauseSessionButton = getElement<HTMLButtonElement>('#pause-session-btn');
 const copyEventsButton = getElement<HTMLButtonElement>('#copy-events-btn');
 
 const frameCanvas = document.createElement('canvas');
@@ -159,7 +165,44 @@ let selectedCameraId = '';
 let stableGeometryCount = 0;
 let lastGeometry: { areaRatio: number; aspectRatio: number; centerX: number; centerY: number } | null = null;
 let debugLogEnabled = false;
+let isSessionPaused = false;
 const debugEventLines: string[] = [];
+
+
+interface DecodeFunnelCounters {
+  sampledFrames: number;
+  noQrDetected: number;
+  qrDetected: number;
+  geometryRejected: number;
+  protocolMagicRejected: number;
+  parseRejected: number;
+  armingWindowRejected: number;
+  foreignTransferRejected: number;
+  packetCrcRejected: number;
+  duplicateScannerRejected: number;
+  duplicatePacketRejected: number;
+  acceptedUnique: number;
+}
+
+interface SessionLifecycleLog {
+  scanStartedAt: number | null;
+  headerAcceptedAt: number | null;
+  headerRepeatedCount: number;
+  firstAcceptedDataIndex: number | null;
+  firstAcceptedDataAt: number | null;
+  endSeenAt: number | null;
+  failureAt: number | null;
+}
+
+interface RunningStats {
+  sampleIntervalsMs: number[];
+  decodeDurationsMs: number[];
+  sampleAttemptCount: number;
+  longestDuplicateStreak: number;
+  duplicateStreak: number;
+  duplicateBeforeEnd: number;
+  duplicateAfterEnd: number;
+}
 
 interface ScanLoopDiagnostics {
   loopTicks: number;
@@ -178,6 +221,46 @@ interface ScanLoopDiagnostics {
   maxDecodeMs: number;
   lastLoopAtMs: number | null;
 }
+
+
+let decodeFunnelCounters: DecodeFunnelCounters = {
+  sampledFrames: 0,
+  noQrDetected: 0,
+  qrDetected: 0,
+  geometryRejected: 0,
+  protocolMagicRejected: 0,
+  parseRejected: 0,
+  armingWindowRejected: 0,
+  foreignTransferRejected: 0,
+  packetCrcRejected: 0,
+  duplicateScannerRejected: 0,
+  duplicatePacketRejected: 0,
+  acceptedUnique: 0
+};
+
+let sessionLifecycleLog: SessionLifecycleLog = {
+  scanStartedAt: null,
+  headerAcceptedAt: null,
+  headerRepeatedCount: 0,
+  firstAcceptedDataIndex: null,
+  firstAcceptedDataAt: null,
+  endSeenAt: null,
+  failureAt: null
+};
+
+let runningStats: RunningStats = {
+  sampleIntervalsMs: [],
+  decodeDurationsMs: [],
+  sampleAttemptCount: 0,
+  longestDuplicateStreak: 0,
+  duplicateStreak: 0,
+  duplicateBeforeEnd: 0,
+  duplicateAfterEnd: 0
+};
+
+const duplicatePacketHistogram = new Map<number, number>();
+let lastSampleAttemptAtMs = 0;
+let previousAcceptedReceivedCount = 0;
 
 let scanLoopDiagnostics: ScanLoopDiagnostics = {
   loopTicks: 0,
@@ -218,6 +301,105 @@ function maybeLogCounterMilestone(label: string, count: number, step = 10): void
   }
 }
 
+
+function percentile(values: number[], p: number): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+  return sorted[index];
+}
+
+function average(values: number[]): number {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function recordSampleInterval(now: number): void {
+  runningStats.sampleAttemptCount += 1;
+  if (lastSampleAttemptAtMs > 0) {
+    runningStats.sampleIntervalsMs.push(Math.max(0, Math.round(now - lastSampleAttemptAtMs)));
+  }
+  lastSampleAttemptAtMs = now;
+}
+
+function trackDuplicatePacket(packetIndex: number): void {
+  const next = (duplicatePacketHistogram.get(packetIndex) ?? 0) + 1;
+  duplicatePacketHistogram.set(packetIndex, next);
+  runningStats.duplicateStreak += 1;
+  runningStats.longestDuplicateStreak = Math.max(runningStats.longestDuplicateStreak, runningStats.duplicateStreak);
+  if (sessionLifecycleLog.endSeenAt === null) {
+    runningStats.duplicateBeforeEnd += 1;
+  } else {
+    runningStats.duplicateAfterEnd += 1;
+  }
+}
+
+function summarizeTopDuplicateIndices(limit = 5): string {
+  if (duplicatePacketHistogram.size === 0) return 'none';
+  const top = [...duplicatePacketHistogram.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([index, count]) => `${index}:${count}`);
+  return top.join(', ');
+}
+
+function summarizeMissingRangeStats(snapshot: ReceiverSnapshot): string {
+  const ranges = snapshot.missingRanges;
+  if (!ranges.length) return 'missingRanges=[] highestContiguousFromZero=none largestMissingGap=0';
+  const largestGap = Math.max(...ranges.map((range) => (range.end - range.start) + 1));
+  return `missingRanges=[${formatMissingRanges(snapshot, 12)}] highestContiguousFromZero=${snapshot.lastContiguousPacketIndex} largestMissingGap=${largestGap}`;
+}
+
+function buildFailureSnapshot(snapshot: ReceiverSnapshot): string {
+  const ingest = receiverIngest.getDiagnostics();
+  const sampleAvg = average(runningStats.sampleIntervalsMs);
+  const decodeAvg = average(runningStats.decodeDurationsMs);
+  const p95Sample = percentile(runningStats.sampleIntervalsMs, 0.95);
+  const p95Decode = percentile(runningStats.decodeDurationsMs, 0.95);
+  const missingCount = snapshot.missingRanges.reduce((sum, range) => sum + ((range.end - range.start) + 1), 0);
+  const timeToHeaderLock = sessionLifecycleLog.scanStartedAt && sessionLifecycleLog.headerAcceptedAt
+    ? sessionLifecycleLog.headerAcceptedAt - sessionLifecycleLog.scanStartedAt
+    : null;
+  const timeFromHeaderToFirstData = sessionLifecycleLog.headerAcceptedAt && sessionLifecycleLog.firstAcceptedDataAt
+    ? sessionLifecycleLog.firstAcceptedDataAt - sessionLifecycleLog.headerAcceptedAt
+    : null;
+  const timeFromLastUniqueToEnd = sessionLifecycleLog.endSeenAt && snapshot.lastUniquePacketAt
+    ? sessionLifecycleLog.endSeenAt - snapshot.lastUniquePacketAt
+    : null;
+  const timeFromEndToFailure = sessionLifecycleLog.endSeenAt && sessionLifecycleLog.failureAt
+    ? sessionLifecycleLog.failureAt - sessionLifecycleLog.endSeenAt
+    : null;
+
+  return [
+    'FAIL SNAPSHOT',
+    `transferId=${shortTransferId(snapshot.transferId)}`,
+    `reason=${snapshot.error?.code ?? 'UNKNOWN'}`,
+    `unique=${snapshot.receivedCount}/${snapshot.totalPackets ?? 0}`,
+    `sampled=${decodeFunnelCounters.sampledFrames}`,
+    `qrDetected=${decodeFunnelCounters.qrDetected}`,
+    `acceptedUnique=${decodeFunnelCounters.acceptedUnique}`,
+    `duplicateScanner=${decodeFunnelCounters.duplicateScannerRejected}`,
+    `duplicatePacket=${decodeFunnelCounters.duplicatePacketRejected}`,
+    `geometryRejected=${decodeFunnelCounters.geometryRejected}`,
+    `protocolRejected=${decodeFunnelCounters.protocolMagicRejected}`,
+    `parseRejected=${decodeFunnelCounters.parseRejected}`,
+    `packetCrcRejected=${decodeFunnelCounters.packetCrcRejected}`,
+    `foreignTransferRejected=${decodeFunnelCounters.foreignTransferRejected}`,
+    `armingWindowRejected=${decodeFunnelCounters.armingWindowRejected}`,
+    `avgSampleIntervalMs=${sampleAvg.toFixed(1)} p95SampleIntervalMs=${p95Sample} maxSampleIntervalMs=${Math.round(Math.max(0, ...runningStats.sampleIntervalsMs))}`,
+    `avgDecodeMs=${decodeAvg.toFixed(1)} p95DecodeMs=${p95Decode} maxDecodeMs=${Math.round(Math.max(0, ...runningStats.decodeDurationsMs))}`,
+    `queueDepthMax=${ingest.queueDepthMax} queueWaitAvgMs=${ingest.queueWaitAvgMs.toFixed(1)} queueWaitP95Ms=${ingest.queueWaitP95Ms}`,
+    `ingestDurationAvgMs=${ingest.ingestDurationAvgMs.toFixed(1)} ingestDurationP95Ms=${ingest.ingestDurationP95Ms}`,
+    `headerAcceptedAt=${sessionLifecycleLog.headerAcceptedAt} headerRepeatedCount=${sessionLifecycleLog.headerRepeatedCount}`,
+    `firstAcceptedDataIndex=${sessionLifecycleLog.firstAcceptedDataIndex} firstAcceptedDataAt=${sessionLifecycleLog.firstAcceptedDataAt}`,
+    `endSeenAt=${sessionLifecycleLog.endSeenAt} failureAt=${sessionLifecycleLog.failureAt}`,
+    `timeToHeaderLock=${timeToHeaderLock} timeFromHeaderToFirstData=${timeFromHeaderToFirstData} timeFromLastUniqueToEnd=${timeFromLastUniqueToEnd} timeFromEndToFailure=${timeFromEndToFailure}`,
+    `duplicatesTopIndices=${summarizeTopDuplicateIndices()} longestDuplicateStreak=${runningStats.longestDuplicateStreak} beforeEnd=${runningStats.duplicateBeforeEnd} afterEnd=${runningStats.duplicateAfterEnd}`,
+    `${summarizeMissingRangeStats(snapshot)} missingCount=${missingCount}`,
+    `missingCountBeforeEnd=${sessionLifecycleLog.endSeenAt === null ? missingCount : 'n/a'} missingCountAfterEndGrace=${sessionLifecycleLog.endSeenAt !== null ? missingCount : 'n/a'}`
+  ].join(' ');
+}
+
 function formatScanLoopDiagnostics(snapshot: ReceiverSnapshot): string {
   const ingest = receiverIngest.getDiagnostics();
   const dim = `${video.videoWidth || 0}x${video.videoHeight || 0}`;
@@ -231,15 +413,17 @@ function formatScanLoopDiagnostics(snapshot: ReceiverSnapshot): string {
     `received=${snapshot.receivedCount}/${snapshot.totalPackets ?? 0} missingRanges=${formatMissingRanges(snapshot, 8)}`,
     `cameraReadyState=${video.readyState} video=${dim}`,
     `loopTicks=${scanLoopDiagnostics.loopTicks} throttled=${scanLoopDiagnostics.throttledTicks} lagSpikes=${scanLoopDiagnostics.lagSpikes} maxLoopDeltaMs=${scanLoopDiagnostics.maxLoopDeltaMs}`,
-    `decodeAttempts=${scanLoopDiagnostics.decodeAttempts} hits=${scanLoopDiagnostics.decodeHits} hitRate=${decodeHitRate}% noQrFound=${scanLoopDiagnostics.noQrFound} geometryRejected=${scanLoopDiagnostics.geometryRejected}`,
-    `protocolMagicRejected=${scanLoopDiagnostics.protocolMagicRejected} parseRejected=${scanLoopDiagnostics.parseRejected}`,
-    `slowDecodeFrames=${scanLoopDiagnostics.slowDecodeFrames} maxDecodeMs=${scanLoopDiagnostics.maxDecodeMs}`,
-    `ingest: acceptedFrames=${ingest.acceptedFrames} acceptedUniquePackets=${ingest.acceptedUniquePackets} duplicateProtocolPackets=${ingest.duplicateProtocolPackets} duplicateScannerPayloads=${ingest.duplicateScannerPayloads} droppedQueued=${ingest.droppedQueuedPayloads} foreignTransferFrames=${ingest.foreignTransferFrames} badPacketCrcFrames=${ingest.badPacketCrcFrames} malformed=${ingest.malformedPayloads}`,
+    `decodeAttempts=${scanLoopDiagnostics.decodeAttempts} hits=${scanLoopDiagnostics.decodeHits} hitRate=${decodeHitRate}% noQrFound=${scanLoopDiagnostics.noQrFound} geometryRejected=${scanLoopDiagnostics.geometryRejected}` ,
+    `funnel sampled=${decodeFunnelCounters.sampledFrames} noQr=${decodeFunnelCounters.noQrDetected} qrDetected=${decodeFunnelCounters.qrDetected} geometryRejected=${decodeFunnelCounters.geometryRejected} protocolMagicRejected=${decodeFunnelCounters.protocolMagicRejected} parseRejected=${decodeFunnelCounters.parseRejected} armingWindowRejected=${decodeFunnelCounters.armingWindowRejected} foreignTransferRejected=${decodeFunnelCounters.foreignTransferRejected} packetCrcRejected=${decodeFunnelCounters.packetCrcRejected} duplicateScannerRejected=${decodeFunnelCounters.duplicateScannerRejected} duplicatePacketRejected=${decodeFunnelCounters.duplicatePacketRejected} acceptedUnique=${decodeFunnelCounters.acceptedUnique}`,
+    `cadence sampleAttemptCount=${runningStats.sampleAttemptCount} avgSampleIntervalMs=${average(runningStats.sampleIntervalsMs).toFixed(1)} p95SampleIntervalMs=${percentile(runningStats.sampleIntervalsMs, 0.95)} maxSampleIntervalMs=${Math.round(Math.max(0, ...runningStats.sampleIntervalsMs))}` ,
+    `decodeDurationAvgMs=${average(runningStats.decodeDurationsMs).toFixed(1)} decodeDurationP95Ms=${percentile(runningStats.decodeDurationsMs, 0.95)} decodeDurationMaxMs=${Math.round(Math.max(0, ...runningStats.decodeDurationsMs))} slowDecodeFrames=${scanLoopDiagnostics.slowDecodeFrames}` ,
+    `ingest: acceptedFrames=${ingest.acceptedFrames} acceptedUniquePackets=${ingest.acceptedUniquePackets} duplicateProtocolPackets=${ingest.duplicateProtocolPackets} duplicateScannerPayloads=${ingest.duplicateScannerPayloads} droppedQueued=${ingest.droppedQueuedPayloads} foreignTransferFrames=${ingest.foreignTransferFrames} badPacketCrcFrames=${ingest.badPacketCrcFrames} malformed=${ingest.malformedPayloads} queueDepthMax=${ingest.queueDepthMax} queueWaitAvgMs=${ingest.queueWaitAvgMs.toFixed(1)} queueWaitP95Ms=${ingest.queueWaitP95Ms} ingestDurationAvgMs=${ingest.ingestDurationAvgMs.toFixed(1)} ingestDurationP95Ms=${ingest.ingestDurationP95Ms} overflowDup=${ingest.overflowDropsDuplicate} overflowNonDup=${ingest.overflowDropsNonDuplicate}`,
     '--- Receiver Event Timeline ---'
   ].join('\n');
 }
 
-function appendDebugEvent(message: string): void {
+function appendDebugEvent(message: string, force = false): void {
+  if (isSessionPaused && !force) return;
   const timestamp = new Date().toLocaleTimeString();
   debugEventLines.push(`[${timestamp}] ${message}`);
   if (debugEventLines.length > DEBUG_EVENT_LOG_CAP) {
@@ -282,15 +466,44 @@ const receiverIngest = new ReceiverIngestService({
 
     if (event.type === 'frameAccepted') {
       appendDebugEvent(`Frame accepted: (${shortTransferId(event.tuple.sessionId)}, ${event.tuple.streamId}, ${event.tuple.seq})`);
+      runningStats.duplicateStreak = 0;
+      if (event.frame.frameType === FRAME_TYPE_HEADER) {
+        if (sessionLifecycleLog.headerAcceptedAt === null) {
+          sessionLifecycleLog.headerAcceptedAt = Date.now();
+        } else {
+          sessionLifecycleLog.headerRepeatedCount += 1;
+        }
+      }
+      if (event.frame.frameType === FRAME_TYPE_DATA) {
+        if (event.snapshot.receivedCount > previousAcceptedReceivedCount) {
+          if (sessionLifecycleLog.firstAcceptedDataAt === null) {
+            sessionLifecycleLog.firstAcceptedDataAt = Date.now();
+            sessionLifecycleLog.firstAcceptedDataIndex = event.tuple.seq;
+          }
+          decodeFunnelCounters.acceptedUnique += 1;
+          runningStats.duplicateStreak = 0;
+        } else {
+          decodeFunnelCounters.duplicatePacketRejected += 1;
+          trackDuplicatePacket(event.tuple.seq);
+        }
+        previousAcceptedReceivedCount = event.snapshot.receivedCount;
+      }
+      if (event.frame.frameType === FRAME_TYPE_END) {
+        sessionLifecycleLog.endSeenAt = Date.now();
+      }
       return;
     }
 
     if (event.type === 'frameDropped') {
-      appendDebugEvent(`Frame dropped (${event.reason}): (${shortTransferId(event.tuple.sessionId)}, ${event.tuple.streamId}, ${event.tuple.seq})`);
+      if (event.reason === 'foreignTransferFrame') decodeFunnelCounters.foreignTransferRejected += 1;
+      if (event.reason === 'duplicateScannerPayload') decodeFunnelCounters.duplicateScannerRejected += 1;
+      const tupleLabel = event.tuple ? `(${shortTransferId(event.tuple.sessionId)}, ${event.tuple.streamId}, ${event.tuple.seq})` : '(no-frame)';
+      appendDebugEvent(`Frame dropped (${event.reason}): ${tupleLabel}`);
       return;
     }
 
     if (event.type === 'duplicateScannerPayload') {
+      decodeFunnelCounters.duplicateScannerRejected += 1;
       appendDebugEvent('Duplicate scanner payload dropped');
       return;
     }
@@ -301,6 +514,7 @@ const receiverIngest = new ReceiverIngestService({
     }
 
     if (event.type === 'badPacketCrcIgnored') {
+      decodeFunnelCounters.packetCrcRejected += 1;
       appendDebugEvent('Packet CRC mismatch ignored');
       return;
     }
@@ -351,7 +565,7 @@ function updateProgress(snapshot: ReceiverSnapshot): void {
   progressBar.style.width = `${pct}%`;
 
   if (snapshot.state === 'IDLE' || snapshot.state === 'SCANNING') {
-    progressText.textContent = 'Waiting for header';
+    progressText.textContent = 'Searching for transfer header';
   } else if (snapshot.state === 'VERIFYING') {
     progressText.textContent = 'Verifying';
   } else if (snapshot.state === 'SUCCESS') {
@@ -441,7 +655,7 @@ function hasStableQrGeometry(result: NonNullable<ReturnType<typeof jsQR>>, width
 
 function setStage(state: ReceiverSnapshot['state'], label: string): void {
   panel.dataset.state = state;
-  statusEl.textContent = label;
+  statusEl.textContent = isSessionPaused ? `${label} (paused)` : label;
 }
 
 function applyDownload(snapshot: ReceiverSnapshot): void {
@@ -460,6 +674,7 @@ function applyDownload(snapshot: ReceiverSnapshot): void {
 
 function getLockedTransferActivityAt(snapshot: ReceiverSnapshot): number | null {
   if (!snapshot.lockConfirmed) return null;
+  if (snapshot.lastMatchingFrameAt !== null) return snapshot.lastMatchingFrameAt;
   if (snapshot.lastLockedTransferFrameAt !== null) return snapshot.lastLockedTransferFrameAt;
   return snapshot.lastUniquePacketAt;
 }
@@ -489,18 +704,18 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
 
   if (snapshot.state === 'IDLE') {
     setStage('IDLE', 'Ready to scan');
-    lockStatusEl.textContent = 'Searching for start frame...';
+    lockStatusEl.textContent = 'Waiting for initial QR';
     lastPacketEl.textContent = '';
     return;
   }
 
   if (snapshot.state === 'SCANNING') {
-    setStage('SCANNING', 'Searching for start frame...');
+    setStage('SCANNING', 'Searching for transfer header');
     lockStatusEl.textContent = snapshot.transferId
       ? `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`
       : snapshot.headerConfirmations > 0
-        ? `Searching for start frame (${snapshot.headerConfirmations}/${RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS} confirmations)`
-        : 'Searching for start frame...';
+        ? `Searching for transfer header (${snapshot.headerConfirmations}/${RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS} confirmations)`
+        : 'Waiting for initial QR';
     lastPacketEl.textContent = transferDetails;
     if (!warningEl.textContent.startsWith('Signal Lost')) {
       warningEl.textContent = '';
@@ -540,7 +755,7 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
   const code = snapshot.error?.code;
   lockStatusEl.textContent = snapshot.transferId
     ? `Locked to transfer ${shortTransferId(snapshot.transferId)}${transferDetails ? ` • ${transferDetails}` : ''}`
-    : 'Searching for start frame...';
+    : 'Waiting for initial QR';
   setStage('ERROR', 'Transfer error');
   const diagnosticsContext = formatDiagnosticsContext();
   if (code === RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT) {
@@ -557,7 +772,9 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
   } else {
     warningEl.textContent = snapshot.error?.message ?? 'Transfer failed. Restart sender and retry.';
   }
+  sessionLifecycleLog.failureAt = Date.now();
   appendDebugEvent(`Transfer failed: ${code ?? 'UNKNOWN'}${snapshot.error?.message ? ` (${snapshot.error.message})` : ''}`);
+  appendDebugEvent(buildFailureSnapshot(snapshot), true);
   stopScanLoop(true);
   scanButton.textContent = 'Restart Scan';
 }
@@ -568,6 +785,8 @@ function resetUiForNewScan(): void {
   revokeDownloadUrl();
   downloadButton.disabled = true;
   warningEl.textContent = '';
+  isSessionPaused = false;
+  pauseSessionButton.textContent = 'Pause Session';
   ingestDecodeError = null;
   successSoundPlayed = false;
   lastPacketEl.textContent = '';
@@ -577,10 +796,16 @@ function resetUiForNewScan(): void {
   lastReceivedTimeEl.textContent = 'Last packet: -';
   stableGeometryCount = 0;
   lastGeometry = null;
-  lockStatusEl.textContent = 'Searching for start frame...';
-  progressHealthEl.textContent = 'Progress health: waiting for first frame…';
+  lockStatusEl.textContent = 'Waiting for initial QR';
+  progressHealthEl.textContent = 'Progress health: waiting for initial QR…';
   diagnosticHintEl.textContent = 'Diagnostics: waiting for scan data.';
   debugEventLines.length = 0;
+  decodeFunnelCounters = { sampledFrames: 0, noQrDetected: 0, qrDetected: 0, geometryRejected: 0, protocolMagicRejected: 0, parseRejected: 0, armingWindowRejected: 0, foreignTransferRejected: 0, packetCrcRejected: 0, duplicateScannerRejected: 0, duplicatePacketRejected: 0, acceptedUnique: 0 };
+  sessionLifecycleLog = { scanStartedAt: Date.now(), headerAcceptedAt: null, headerRepeatedCount: 0, firstAcceptedDataIndex: null, firstAcceptedDataAt: null, endSeenAt: null, failureAt: null };
+  runningStats = { sampleIntervalsMs: [], decodeDurationsMs: [], sampleAttemptCount: 0, longestDuplicateStreak: 0, duplicateStreak: 0, duplicateBeforeEnd: 0, duplicateAfterEnd: 0 };
+  duplicatePacketHistogram.clear();
+  lastSampleAttemptAtMs = 0;
+  previousAcceptedReceivedCount = 0;
   scanLoopDiagnostics = {
     loopTicks: 0,
     throttledTicks: 0,
@@ -615,6 +840,11 @@ function processFrame(now: number): void {
   }
   scanLoopDiagnostics.lastLoopAtMs = now;
 
+  if (isSessionPaused) {
+    rafId = requestAnimationFrame(processFrame);
+    return;
+  }
+
   if (!video.videoWidth || !video.videoHeight) {
     rafId = requestAnimationFrame(processFrame);
     return;
@@ -628,6 +858,8 @@ function processFrame(now: number): void {
   }
 
   lastScanAt = now;
+  recordSampleInterval(now);
+  decodeFunnelCounters.sampledFrames += 1;
   const decodeStartedAt = performance.now();
   frameCanvas.width = video.videoWidth;
   frameCanvas.height = video.videoHeight;
@@ -636,6 +868,7 @@ function processFrame(now: number): void {
   scanLoopDiagnostics.decodeAttempts += 1;
   const result = jsQR(image.data, image.width, image.height);
   const decodeElapsedMs = Math.round(performance.now() - decodeStartedAt);
+  runningStats.decodeDurationsMs.push(decodeElapsedMs);
   scanLoopDiagnostics.maxDecodeMs = Math.max(scanLoopDiagnostics.maxDecodeMs, decodeElapsedMs);
   if (decodeElapsedMs > SLOW_QR_DECODE_THRESHOLD_MS) {
     scanLoopDiagnostics.slowDecodeFrames += 1;
@@ -643,16 +876,19 @@ function processFrame(now: number): void {
 
   if (!result?.binaryData?.length) {
     scanLoopDiagnostics.noQrFound += 1;
+    decodeFunnelCounters.noQrDetected += 1;
     rafId = requestAnimationFrame(processFrame);
     return;
   }
 
   scanLoopDiagnostics.decodeHits += 1;
+  decodeFunnelCounters.qrDetected += 1;
   {
     const nowMs = Date.now();
     const rawPayload = Uint8Array.from(result.binaryData);
     if (!isProtocolPayload(rawPayload)) {
       scanLoopDiagnostics.protocolMagicRejected += 1;
+      decodeFunnelCounters.protocolMagicRejected += 1;
       maybeLogCounterMilestone('Protocol magic-rejected QR payloads', scanLoopDiagnostics.protocolMagicRejected, 5);
       rafId = requestAnimationFrame(processFrame);
       return;
@@ -663,6 +899,7 @@ function processFrame(now: number): void {
       parsedFrame = parseFrame(rawPayload);
     } catch {
       scanLoopDiagnostics.parseRejected += 1;
+      decodeFunnelCounters.parseRejected += 1;
       maybeLogCounterMilestone('Protocol parse rejections', scanLoopDiagnostics.parseRejected, 3);
       rafId = requestAnimationFrame(processFrame);
       return;
@@ -671,12 +908,19 @@ function processFrame(now: number): void {
     const geometryDecision = shouldProcessParsedFrameWithGeometry(hasStableQrGeometry(result, image.width, image.height));
     if (geometryDecision.geometryRejected) {
       scanLoopDiagnostics.geometryRejected += 1;
+      decodeFunnelCounters.geometryRejected += 1;
       maybeLogCounterMilestone('Geometry-rejected QR detections', scanLoopDiagnostics.geometryRejected, 5);
     }
 
     lastProtocolFrameSeenAt = nowMs;
 
     if (geometryDecision.shouldProcess) {
+      const machineSnapshot = receiverMachine.snapshot;
+      if (!machineSnapshot.lockConfirmed && parsedFrame.frameType !== FRAME_TYPE_HEADER) {
+        decodeFunnelCounters.armingWindowRejected += 1;
+        rafId = requestAnimationFrame(processFrame);
+        return;
+      }
       scanLoopDiagnostics.enqueueCalls += 1;
       void receiverIngest.enqueue(rawPayload, nowMs, parsedFrame).then((snapshot) => {
         if (snapshot) {
@@ -697,6 +941,11 @@ function updateSignalHealth(): void {
   const snapshot = receiverMachine.tick(now);
   applySnapshot(snapshot);
 
+  if (isSessionPaused) {
+    progressHealthEl.textContent = 'Progress health: paused (logging frozen)';
+    return;
+  }
+
   const lockedActivityAt = getLockedTransferActivityAt(snapshot);
   const diagnostics = receiverIngest.getDiagnostics();
 
@@ -706,16 +955,17 @@ function updateSignalHealth(): void {
       lastDiscoveryActivityAt = now;
     }
 
-    const discoveryReference = Math.max(lastDiscoveryActivityAt, lastProtocolFrameSeenAt, scanStartedAt);
+    const scanReference = snapshot.scanStartedAt ?? scanStartedAt;
+    const discoveryReference = Math.max(lastDiscoveryActivityAt, lastProtocolFrameSeenAt, scanReference);
     const discoveryAgeSeconds = discoveryReference > 0 ? Math.max(0, Math.floor((now - discoveryReference) / 1000)) : null;
 
     progressHealthEl.textContent = discoveryAgeSeconds === null
-      ? 'Progress health: waiting for protocol frames to lock transfer…'
-      : `Progress health: pre-lock discovery active (${snapshot.headerConfirmations}/${RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS} header confirmations, ${discoveryAgeSeconds}s since last protocol frame)`;
+      ? 'Progress health: waiting for initial QR…'
+      : `Progress health: searching for transfer header (${snapshot.headerConfirmations}/${RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS} header confirmations, ${discoveryAgeSeconds}s since last protocol frame)`;
 
-    if (discoveryReference > 0 && now - discoveryReference > SIGNAL_LOST_MS) {
-      warningEl.textContent = `Signal Lost - No lock yet and no decodable protocol frames for ${discoveryAgeSeconds ?? 0}s. Check framing/lighting and keep sender QR fully visible.`;
-    }
+    warningEl.textContent = snapshot.headerConfirmations > 0
+      ? 'Searching for transfer header… keep sender QR centered and steady.'
+      : 'Waiting for initial QR… align sender QR inside the frame.';
 
     lastReceivedTimeEl.textContent = discoveryReference > 0
       ? `Last packet: ${new Date(discoveryReference).toLocaleTimeString()}`
@@ -723,15 +973,15 @@ function updateSignalHealth(): void {
     return;
   }
 
-  const uniqueReference = snapshot.lastUniquePacketAt ?? scanStartedAt;
+  const uniqueReference = snapshot.lastUniquePacketAt ?? snapshot.headerLockedAt ?? snapshot.scanStartedAt ?? scanStartedAt;
   const sinceLastUniqueSeconds = uniqueReference > 0 ? Math.max(0, Math.floor((now - uniqueReference) / 1000)) : null;
 
   let timeoutText = 'Progress timeout inactive';
   if (snapshot.lastUniquePacketAt) {
     const uniqueRemainingMs = Math.max(0, RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS - (now - snapshot.lastUniquePacketAt));
-    const activityRemainingMs = snapshot.lastLockedTransferFrameAt === null
+    const activityRemainingMs = snapshot.lastMatchingFrameAt === null
       ? 0
-      : Math.max(0, RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS - (now - snapshot.lastLockedTransferFrameAt));
+      : Math.max(0, RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS - (now - snapshot.lastMatchingFrameAt));
     const uniqueRemainingSeconds = Math.ceil(uniqueRemainingMs / 1000);
     const activityRemainingSeconds = Math.ceil(activityRemainingMs / 1000);
     timeoutText = `no-progress in ${uniqueRemainingSeconds}s (locked-activity grace ${activityRemainingSeconds}s)`;
@@ -749,11 +999,11 @@ function updateSignalHealth(): void {
     ? `Last packet: ${new Date(postLockReference).toLocaleTimeString()}`
     : 'Last packet: -';
 
-  if (postLockReference > 0 && now - postLockReference > SIGNAL_LOST_MS) {
+  const canShowLockedSignalLoss = (snapshot.state === 'RECEIVING' || snapshot.state === 'VERIFYING') && Boolean(snapshot.transferId);
+  if (canShowLockedSignalLoss && postLockReference > 0 && now - postLockReference > SIGNAL_LOST_MS) {
     warningEl.textContent = `Signal Lost - Locked transfer has no frame activity for ${Math.floor((now - postLockReference) / 1000)}s. ${formatDiagnosticsContext()} (dup:${diagnostics.duplicateScannerPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads})`;
   }
 }
-
 
 
 async function populateCameraOptions(): Promise<void> {
@@ -813,10 +1063,12 @@ async function startScan(): Promise<void> {
     await waitForVideoReady();
     await video.play();
     await populateCameraOptions();
-    setStage('SCANNING', 'Waiting for header');
-    lockStatusEl.textContent = 'Searching for start frame...';
+    setStage('SCANNING', 'Waiting for initial QR');
+    lockStatusEl.textContent = 'Waiting for initial QR';
     lastScanAt = 0;
     scanStartedAt = Date.now();
+    isSessionPaused = false;
+    pauseSessionButton.textContent = 'Pause Session';
     scanButton.textContent = 'Stop Scan';
     rafId = requestAnimationFrame(processFrame);
     monitorInterval = window.setInterval(updateSignalHealth, 1000);
@@ -832,6 +1084,8 @@ scanButton.addEventListener('click', async () => {
   if (activeStream) {
     stopScanLoop(true);
     receiverMachine.reset();
+    isSessionPaused = false;
+    pauseSessionButton.textContent = 'Pause Session';
     applySnapshot(receiverMachine.snapshot);
     return;
   }
@@ -851,15 +1105,29 @@ debugLogEnabledInput.addEventListener('change', () => {
   }
 });
 
+
+pauseSessionButton.addEventListener('click', () => {
+  isSessionPaused = !isSessionPaused;
+  pauseSessionButton.textContent = isSessionPaused ? 'Resume Session' : 'Pause Session';
+  appendDebugEvent(isSessionPaused ? 'Session paused: ingest/logging frozen' : 'Session resumed', true);
+  if (isSessionPaused) {
+    warningEl.textContent = 'Session paused. Logging is frozen until resumed.';
+  } else if (warningEl.textContent.includes('Session paused')) {
+    warningEl.textContent = '';
+  }
+  applySnapshot(receiverMachine.snapshot);
+});
+
 copyEventsButton.addEventListener('click', async () => {
   const summary = formatScanLoopDiagnostics(receiverMachine.snapshot);
   const timeline = debugEventLines.length > 0 ? debugEventLines.join('\n') : 'No events yet.';
   const report = `${summary}\n${timeline}`;
+  localStorage.setItem(RECEIVER_LOG_CACHE_KEY, report);
   try {
     await navigator.clipboard.writeText(report);
-    warningEl.textContent = `Copied ${debugEventLines.length} receiver timeline event${debugEventLines.length === 1 ? '' : 's'} to clipboard.`;
+    warningEl.textContent = `Copied ${debugEventLines.length} receiver timeline event${debugEventLines.length === 1 ? '' : 's'} to clipboard and cached locally.`;
   } catch {
-    warningEl.textContent = 'Unable to copy event timeline. Your browser blocked clipboard access.';
+    warningEl.textContent = 'Log data cached locally, but clipboard copy was blocked by the browser.';
   }
 });
 
