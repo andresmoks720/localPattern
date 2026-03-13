@@ -24,6 +24,8 @@ const MAX_CENTER_DRIFT_RATIO = 0.12;
 const STABLE_SCANS_REQUIRED = 2;
 const THEME_KEY = 'qdb_theme';
 const DEBUG_EVENT_LOG_CAP = 100;
+const SCAN_LOOP_LAG_THRESHOLD_MS = 500;
+const SLOW_QR_DECODE_THRESHOLD_MS = 120;
 
 const logger = {
   debug: (...args: unknown[]) => {
@@ -164,9 +166,82 @@ let lastGeometry: { areaRatio: number; aspectRatio: number; centerX: number; cen
 let debugLogEnabled = false;
 const debugEventLines: string[] = [];
 
+interface ScanLoopDiagnostics {
+  loopTicks: number;
+  throttledTicks: number;
+  lagSpikes: number;
+  maxLoopDeltaMs: number;
+  decodeAttempts: number;
+  decodeHits: number;
+  geometryRejected: number;
+  nonProtocolPayloads: number;
+  parseFailures: number;
+  armingWindowDrops: number;
+  enqueueCalls: number;
+  snapshotUpdates: number;
+  slowDecodeFrames: number;
+  maxDecodeMs: number;
+  lastLoopAtMs: number | null;
+}
+
+let scanLoopDiagnostics: ScanLoopDiagnostics = {
+  loopTicks: 0,
+  throttledTicks: 0,
+  lagSpikes: 0,
+  maxLoopDeltaMs: 0,
+  decodeAttempts: 0,
+  decodeHits: 0,
+  geometryRejected: 0,
+  nonProtocolPayloads: 0,
+  parseFailures: 0,
+  armingWindowDrops: 0,
+  enqueueCalls: 0,
+  snapshotUpdates: 0,
+  slowDecodeFrames: 0,
+  maxDecodeMs: 0,
+  lastLoopAtMs: null
+};
+
 function shortTransferId(transferId: string | null): string {
   if (!transferId) return 'unknown';
   return transferId.length <= 8 ? transferId : `${transferId.slice(0, 8)}…`;
+}
+
+function formatMissingRanges(snapshot: ReceiverSnapshot, maxRanges = 4): string {
+  if (!snapshot.missingRanges.length) return 'none';
+  const shown = snapshot.missingRanges.slice(0, maxRanges).map((range) => (
+    range.start === range.end ? `${range.start}` : `${range.start}-${range.end}`
+  ));
+  const suffix = snapshot.missingRanges.length > maxRanges ? ` (+${snapshot.missingRanges.length - maxRanges} more)` : '';
+  return `${shown.join(', ')}${suffix}`;
+}
+
+
+function maybeLogCounterMilestone(label: string, count: number, step = 10): void {
+  if (count > 0 && count % step === 0) {
+    appendDebugEvent(`${label}: ${count}`);
+  }
+}
+
+function formatScanLoopDiagnostics(snapshot: ReceiverSnapshot): string {
+  const ingest = receiverIngest.getDiagnostics();
+  const dim = `${video.videoWidth || 0}x${video.videoHeight || 0}`;
+  const decodeHitRate = scanLoopDiagnostics.decodeAttempts > 0
+    ? Math.round((scanLoopDiagnostics.decodeHits / scanLoopDiagnostics.decodeAttempts) * 100)
+    : 0;
+
+  return [
+    '--- Receiver Debug Summary ---',
+    `state=${snapshot.state} lockConfirmed=${snapshot.lockConfirmed} transferId=${shortTransferId(snapshot.transferId)}`,
+    `received=${snapshot.receivedCount}/${snapshot.totalPackets ?? 0} missingRanges=${formatMissingRanges(snapshot, 8)}`,
+    `cameraReadyState=${video.readyState} video=${dim}`,
+    `loopTicks=${scanLoopDiagnostics.loopTicks} throttled=${scanLoopDiagnostics.throttledTicks} lagSpikes=${scanLoopDiagnostics.lagSpikes} maxLoopDeltaMs=${scanLoopDiagnostics.maxLoopDeltaMs}`,
+    `decodeAttempts=${scanLoopDiagnostics.decodeAttempts} hits=${scanLoopDiagnostics.decodeHits} hitRate=${decodeHitRate}% geometryRejected=${scanLoopDiagnostics.geometryRejected}`,
+    `nonProtocol=${scanLoopDiagnostics.nonProtocolPayloads} parseFailures=${scanLoopDiagnostics.parseFailures} armingDrops=${scanLoopDiagnostics.armingWindowDrops}`,
+    `slowDecodeFrames=${scanLoopDiagnostics.slowDecodeFrames} maxDecodeMs=${scanLoopDiagnostics.maxDecodeMs}`,
+    `ingest: accepted=${ingest.acceptedFrames} dup=${ingest.duplicateScannerPayloads} droppedQueued=${ingest.droppedQueuedPayloads} foreign=${ingest.foreignTransferFrames} badCrc=${ingest.badPacketCrcFrames} malformed=${ingest.malformedPayloads}`,
+    '--- Receiver Event Timeline ---'
+  ].join('\n');
 }
 
 function appendDebugEvent(message: string): void {
@@ -476,7 +551,8 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
   if (code === RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT) {
     warningEl.textContent = `Locked transfer stalled with no unique progress before timeout. ${diagnosticsContext}`;
   } else if (code === RECEIVER_ERROR_CODES.END_INCOMPLETE) {
-    warningEl.textContent = 'END arrived before all packets were received. Restart sender, increase redundancy, and keep sender visible until completion.';
+    const missing = formatMissingRanges(snapshot);
+    warningEl.textContent = `END arrived before all packets were received (missing packet indices: ${missing}). Restart sender, increase redundancy, and keep sender visible until completion.`;
   } else if (code === RECEIVER_ERROR_CODES.HEADER_CONFLICT) {
     warningEl.textContent = 'Header conflict: another transfer stream was detected. Keep only one sender QR visible and retry.';
   } else if (code === RECEIVER_ERROR_CODES.FILE_CRC_MISMATCH) {
@@ -511,33 +587,79 @@ function resetUiForNewScan(): void {
   progressHealthEl.textContent = 'Progress health: waiting for first frame…';
   diagnosticHintEl.textContent = 'Diagnostics: waiting for scan data.';
   debugEventLines.length = 0;
+  scanLoopDiagnostics = {
+    loopTicks: 0,
+    throttledTicks: 0,
+    lagSpikes: 0,
+    maxLoopDeltaMs: 0,
+    decodeAttempts: 0,
+    decodeHits: 0,
+    geometryRejected: 0,
+    nonProtocolPayloads: 0,
+    parseFailures: 0,
+    armingWindowDrops: 0,
+    enqueueCalls: 0,
+    snapshotUpdates: 0,
+    slowDecodeFrames: 0,
+    maxDecodeMs: 0,
+    lastLoopAtMs: null
+  };
   debugLogOutput.textContent = 'No events yet.';
   appendDebugEvent('Scan started');
   applySnapshot(receiverMachine.snapshot);
 }
 
 function processFrame(now: number): void {
+  scanLoopDiagnostics.loopTicks += 1;
+  if (scanLoopDiagnostics.lastLoopAtMs !== null) {
+    const loopDelta = now - scanLoopDiagnostics.lastLoopAtMs;
+    scanLoopDiagnostics.maxLoopDeltaMs = Math.max(scanLoopDiagnostics.maxLoopDeltaMs, Math.round(loopDelta));
+    if (loopDelta > SCAN_LOOP_LAG_THRESHOLD_MS) {
+      scanLoopDiagnostics.lagSpikes += 1;
+      appendDebugEvent(`Scan loop lag spike: ${Math.round(loopDelta)}ms`);
+    }
+  }
+  scanLoopDiagnostics.lastLoopAtMs = now;
+
   if (!video.videoWidth || !video.videoHeight) {
     rafId = requestAnimationFrame(processFrame);
     return;
   }
 
   if (now - lastScanAt < SCAN_INTERVAL_MS) {
+    scanLoopDiagnostics.throttledTicks += 1;
     rafId = requestAnimationFrame(processFrame);
     return;
   }
 
   lastScanAt = now;
+  const decodeStartedAt = performance.now();
   frameCanvas.width = video.videoWidth;
   frameCanvas.height = video.videoHeight;
   frameContext.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
   const image = frameContext.getImageData(0, 0, frameCanvas.width, frameCanvas.height);
+  scanLoopDiagnostics.decodeAttempts += 1;
   const result = jsQR(image.data, image.width, image.height);
+  const decodeElapsedMs = Math.round(performance.now() - decodeStartedAt);
+  scanLoopDiagnostics.maxDecodeMs = Math.max(scanLoopDiagnostics.maxDecodeMs, decodeElapsedMs);
+  if (decodeElapsedMs > SLOW_QR_DECODE_THRESHOLD_MS) {
+    scanLoopDiagnostics.slowDecodeFrames += 1;
+  }
 
-  if (result?.binaryData?.length && hasStableQrGeometry(result, image.width, image.height)) {
+  if (result?.binaryData?.length) {
+    scanLoopDiagnostics.decodeHits += 1;
+    if (!hasStableQrGeometry(result, image.width, image.height)) {
+      scanLoopDiagnostics.geometryRejected += 1;
+      maybeLogCounterMilestone('Geometry-rejected QR detections', scanLoopDiagnostics.geometryRejected, 5);
+      rafId = requestAnimationFrame(processFrame);
+      return;
+    }
+
     const nowMs = Date.now();
     const rawPayload = Uint8Array.from(result.binaryData);
     if (!isProtocolPayload(rawPayload)) {
+      scanLoopDiagnostics.nonProtocolPayloads += 1;
+      maybeLogCounterMilestone('Non-protocol QR payloads', scanLoopDiagnostics.nonProtocolPayloads, 5);
       rafId = requestAnimationFrame(processFrame);
       return;
     }
@@ -546,6 +668,8 @@ function processFrame(now: number): void {
     try {
       parsedFrame = parseFrame(rawPayload);
     } catch {
+      scanLoopDiagnostics.parseFailures += 1;
+      maybeLogCounterMilestone('Protocol parse failures', scanLoopDiagnostics.parseFailures, 3);
       rafId = requestAnimationFrame(processFrame);
       return;
     }
@@ -554,12 +678,16 @@ function processFrame(now: number): void {
 
     const inArmingWindow = nowMs < armingWindowEndsAt;
     if (inArmingWindow && (parsedFrame.frameType === FRAME_TYPE_DATA || parsedFrame.frameType === FRAME_TYPE_END)) {
+      scanLoopDiagnostics.armingWindowDrops += 1;
+      maybeLogCounterMilestone('Arming-window drops', scanLoopDiagnostics.armingWindowDrops, 3);
       rafId = requestAnimationFrame(processFrame);
       return;
     }
 
+    scanLoopDiagnostics.enqueueCalls += 1;
     void receiverIngest.enqueue(rawPayload, nowMs, parsedFrame).then((snapshot) => {
       if (snapshot) {
+        scanLoopDiagnostics.snapshotUpdates += 1;
         applySnapshot(snapshot);
       } else if (ingestDecodeError) {
         warningEl.textContent = `Decode error: ${ingestDecodeError}`;
@@ -730,9 +858,11 @@ debugLogEnabledInput.addEventListener('change', () => {
 });
 
 copyEventsButton.addEventListener('click', async () => {
+  const summary = formatScanLoopDiagnostics(receiverMachine.snapshot);
   const timeline = debugEventLines.length > 0 ? debugEventLines.join('\n') : 'No events yet.';
+  const report = `${summary}\n${timeline}`;
   try {
-    await navigator.clipboard.writeText(timeline);
+    await navigator.clipboard.writeText(report);
     warningEl.textContent = `Copied ${debugEventLines.length} receiver timeline event${debugEventLines.length === 1 ? '' : 's'} to clipboard.`;
   } catch {
     warningEl.textContent = 'Unable to copy event timeline. Your browser blocked clipboard access.';
