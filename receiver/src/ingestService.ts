@@ -1,7 +1,9 @@
 import { FRAME_TYPE_DATA, FRAME_TYPE_HEADER, MAGIC_BYTES, PROTOCOL_ERROR_CODES, ProtocolError, parseFrame, type ReceiverMachine, type ReceiverSnapshot, type TransferFrame } from '@qr-data-bridge/protocol';
+import { RingBuffer, percentile } from './debug/BoundedMetrics';
 
 const DEFAULT_SCANNER_DEDUPE_WINDOW_MS = 250;
 const DEFAULT_MAX_PENDING_INGESTIONS = 64;
+const INGEST_TIMING_SAMPLE_CAP = 256;
 
 export interface ReceiverIngestDiagnostics {
   totalPayloadsSeen: number;
@@ -76,13 +78,9 @@ export class ReceiverIngestService {
 
   private firstAcceptedAt: number | null = null;
 
-  private readonly queueWaitSamples: number[] = [];
+  private readonly queueWaitSamples = new RingBuffer<number>(INGEST_TIMING_SAMPLE_CAP);
 
-  private readonly ingestDurationSamples: number[] = [];
-
-  private queueWaitSumMs = 0;
-
-  private ingestDurationSumMs = 0;
+  private readonly ingestDurationSamples = new RingBuffer<number>(INGEST_TIMING_SAMPLE_CAP);
 
   private diagnosticsValue: ReceiverIngestDiagnostics = {
     totalPayloadsSeen: 0,
@@ -128,10 +126,8 @@ export class ReceiverIngestService {
     this.firstAcceptedAt = null;
     this.pendingIngestions.length = 0;
     this.pendingKeyToIndex.clear();
-    this.queueWaitSamples.length = 0;
-    this.ingestDurationSamples.length = 0;
-    this.queueWaitSumMs = 0;
-    this.ingestDurationSumMs = 0;
+    this.queueWaitSamples.clear();
+    this.ingestDurationSamples.clear();
     this.ingestionChain = Promise.resolve(null);
     this.diagnosticsValue = {
       totalPayloadsSeen: 0,
@@ -321,16 +317,20 @@ export class ReceiverIngestService {
 
   private recordQueueWait(waitMs: number): void {
     this.queueWaitSamples.push(waitMs);
-    this.queueWaitSumMs += waitMs;
-    this.diagnosticsValue.queueWaitAvgMs = this.queueWaitSumMs / this.queueWaitSamples.length;
-    this.diagnosticsValue.queueWaitP95Ms = percentile(this.queueWaitSamples, 0.95);
+    const queueWaitValues = this.queueWaitSamples.values();
+    this.diagnosticsValue.queueWaitAvgMs = queueWaitValues.length === 0
+      ? 0
+      : queueWaitValues.reduce((sum, value) => sum + value, 0) / queueWaitValues.length;
+    this.diagnosticsValue.queueWaitP95Ms = percentile(queueWaitValues, 0.95);
   }
 
   private recordIngestDuration(durationMs: number): void {
     this.ingestDurationSamples.push(durationMs);
-    this.ingestDurationSumMs += durationMs;
-    this.diagnosticsValue.ingestDurationAvgMs = this.ingestDurationSumMs / this.ingestDurationSamples.length;
-    this.diagnosticsValue.ingestDurationP95Ms = percentile(this.ingestDurationSamples, 0.95);
+    const ingestDurationValues = this.ingestDurationSamples.values();
+    this.diagnosticsValue.ingestDurationAvgMs = ingestDurationValues.length === 0
+      ? 0
+      : ingestDurationValues.reduce((sum, value) => sum + value, 0) / ingestDurationValues.length;
+    this.diagnosticsValue.ingestDurationP95Ms = percentile(ingestDurationValues, 0.95);
   }
 
   private isProtocolPayload(rawPayload: Uint8Array): boolean {
@@ -374,13 +374,6 @@ export class ReceiverIngestService {
 
     return 0;
   }
-}
-
-function percentile(values: number[], p: number): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
-  return sorted[index];
 }
 
 function frameTuple(frame: TransferFrame): FrameTuple {

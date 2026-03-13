@@ -1,5 +1,4 @@
 import './style.css';
-import jsQR from 'jsqr';
 import {
   ReceiverMachine,
   MAGIC_BYTES,
@@ -14,6 +13,9 @@ import {
 } from '@qr-data-bridge/protocol';
 import { ReceiverIngestService } from './ingestService';
 import { selectScanIntervalMs, shouldProcessParsedFrameWithGeometry } from './scanPolicy';
+import { DecodePipeline } from './decode/DecodePipeline';
+import { JsQrFrameDecoder, type DecodeGeometry } from './decode/ReceiverFrameDecoder';
+import { RingBuffer, average, maxValue, percentile } from './debug/BoundedMetrics';
 
 const SIGNAL_LOST_MS = 5000;
 const MIN_QR_AREA_RATIO = 0.015;
@@ -23,9 +25,16 @@ const MAX_CENTER_DRIFT_RATIO = 0.12;
 const STABLE_SCANS_REQUIRED = 2;
 const THEME_KEY = 'qdb_theme';
 const DEBUG_EVENT_LOG_CAP = 100;
+const METRICS_SAMPLE_CAP = 256;
 const RECEIVER_LOG_CACHE_KEY = 'receiver_log_cache';
 const SCAN_LOOP_LAG_THRESHOLD_MS = 500;
 const SLOW_QR_DECODE_THRESHOLD_MS = 120;
+const ROI_PADDING_RATIO = 0.4;
+const ROI_MISSES_BEFORE_FULL = 3;
+const FORCE_FULL_EVERY_ATTEMPTS = 10;
+const ROI_NO_SUCCESS_RESET_MS = 1000;
+const MAX_FULL_DECODE_SIDE_PX = 640;
+const MAX_ROI_DECODE_SIDE_PX = 640;
 
 const logger = {
   debug: (...args: unknown[]) => {
@@ -148,6 +157,15 @@ const frameCanvas = document.createElement('canvas');
 const frameContextCandidate = frameCanvas.getContext('2d', { willReadFrequently: true });
 if (!frameContextCandidate) throw new Error('Failed to initialize frame canvas context.');
 const frameContext = frameContextCandidate;
+const frameDecoder = new JsQrFrameDecoder();
+const decodePipeline = new DecodePipeline(frameDecoder, {
+  roiPaddingRatio: ROI_PADDING_RATIO,
+  roiMissesBeforeFull: ROI_MISSES_BEFORE_FULL,
+  forceFullEveryAttempts: FORCE_FULL_EVERY_ATTEMPTS,
+  noSuccessResetMs: ROI_NO_SUCCESS_RESET_MS,
+  maxFullSidePx: MAX_FULL_DECODE_SIDE_PX,
+  maxRoiSidePx: MAX_ROI_DECODE_SIDE_PX
+});
 
 let rafId = 0;
 let monitorInterval: number | null = null;
@@ -173,6 +191,13 @@ interface DecodeFunnelCounters {
   sampledFrames: number;
   noQrDetected: number;
   qrDetected: number;
+  decodeAttempts: number;
+  roiDecodeAttempts: number;
+  roiDecodeSuccesses: number;
+  fullDecodeAttempts: number;
+  fullDecodeSuccesses: number;
+  forcedFullFallbacks: number;
+  roiResets: number;
   geometryRejected: number;
   protocolMagicRejected: number;
   parseRejected: number;
@@ -195,8 +220,8 @@ interface SessionLifecycleLog {
 }
 
 interface RunningStats {
-  sampleIntervalsMs: number[];
-  decodeDurationsMs: number[];
+  sampleIntervalsMs: RingBuffer<number>;
+  decodeDurationsMs: RingBuffer<number>;
   sampleAttemptCount: number;
   longestDuplicateStreak: number;
   duplicateStreak: number;
@@ -220,6 +245,9 @@ interface ScanLoopDiagnostics {
   slowDecodeFrames: number;
   maxDecodeMs: number;
   lastLoopAtMs: number | null;
+  lastDecodeMode: 'full' | 'roi';
+  lastDecodeInputWidth: number;
+  lastDecodeInputHeight: number;
 }
 
 
@@ -227,6 +255,13 @@ let decodeFunnelCounters: DecodeFunnelCounters = {
   sampledFrames: 0,
   noQrDetected: 0,
   qrDetected: 0,
+  decodeAttempts: 0,
+  roiDecodeAttempts: 0,
+  roiDecodeSuccesses: 0,
+  fullDecodeAttempts: 0,
+  fullDecodeSuccesses: 0,
+  forcedFullFallbacks: 0,
+  roiResets: 0,
   geometryRejected: 0,
   protocolMagicRejected: 0,
   parseRejected: 0,
@@ -249,8 +284,8 @@ let sessionLifecycleLog: SessionLifecycleLog = {
 };
 
 let runningStats: RunningStats = {
-  sampleIntervalsMs: [],
-  decodeDurationsMs: [],
+  sampleIntervalsMs: new RingBuffer<number>(METRICS_SAMPLE_CAP),
+  decodeDurationsMs: new RingBuffer<number>(METRICS_SAMPLE_CAP),
   sampleAttemptCount: 0,
   longestDuplicateStreak: 0,
   duplicateStreak: 0,
@@ -261,6 +296,7 @@ let runningStats: RunningStats = {
 const duplicatePacketHistogram = new Map<number, number>();
 let lastSampleAttemptAtMs = 0;
 let previousAcceptedReceivedCount = 0;
+let longestNoUniquePacketStreakSeconds = 0;
 
 let scanLoopDiagnostics: ScanLoopDiagnostics = {
   loopTicks: 0,
@@ -277,8 +313,20 @@ let scanLoopDiagnostics: ScanLoopDiagnostics = {
   snapshotUpdates: 0,
   slowDecodeFrames: 0,
   maxDecodeMs: 0,
-  lastLoopAtMs: null
+  lastLoopAtMs: null,
+  lastDecodeMode: 'full',
+  lastDecodeInputWidth: 0,
+  lastDecodeInputHeight: 0
 };
+
+
+function transferIdToHex(transferId: Uint8Array): string {
+  let hex = '';
+  for (let i = 0; i < transferId.length; i += 1) {
+    hex += transferId[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
 
 function shortTransferId(transferId: string | null): string {
   if (!transferId) return 'unknown';
@@ -302,17 +350,6 @@ function maybeLogCounterMilestone(label: string, count: number, step = 10): void
 }
 
 
-function percentile(values: number[], p: number): number {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
-  return sorted[index];
-}
-
-function average(values: number[]): number {
-  if (!values.length) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
 
 function recordSampleInterval(now: number): void {
   runningStats.sampleAttemptCount += 1;
@@ -352,10 +389,12 @@ function summarizeMissingRangeStats(snapshot: ReceiverSnapshot): string {
 
 function buildFailureSnapshot(snapshot: ReceiverSnapshot): string {
   const ingest = receiverIngest.getDiagnostics();
-  const sampleAvg = average(runningStats.sampleIntervalsMs);
-  const decodeAvg = average(runningStats.decodeDurationsMs);
-  const p95Sample = percentile(runningStats.sampleIntervalsMs, 0.95);
-  const p95Decode = percentile(runningStats.decodeDurationsMs, 0.95);
+  const sampleIntervals = runningStats.sampleIntervalsMs.values();
+  const decodeDurations = runningStats.decodeDurationsMs.values();
+  const sampleAvg = average(sampleIntervals);
+  const decodeAvg = average(decodeDurations);
+  const p95Sample = percentile(sampleIntervals, 0.95);
+  const p95Decode = percentile(decodeDurations, 0.95);
   const missingCount = snapshot.missingRanges.reduce((sum, range) => sum + ((range.end - range.start) + 1), 0);
   const timeToHeaderLock = sessionLifecycleLog.scanStartedAt && sessionLifecycleLog.headerAcceptedAt
     ? sessionLifecycleLog.headerAcceptedAt - sessionLifecycleLog.scanStartedAt
@@ -386,8 +425,8 @@ function buildFailureSnapshot(snapshot: ReceiverSnapshot): string {
     `packetCrcRejected=${decodeFunnelCounters.packetCrcRejected}`,
     `foreignTransferRejected=${decodeFunnelCounters.foreignTransferRejected}`,
     `armingWindowRejected=${decodeFunnelCounters.armingWindowRejected}`,
-    `avgSampleIntervalMs=${sampleAvg.toFixed(1)} p95SampleIntervalMs=${p95Sample} maxSampleIntervalMs=${Math.round(Math.max(0, ...runningStats.sampleIntervalsMs))}`,
-    `avgDecodeMs=${decodeAvg.toFixed(1)} p95DecodeMs=${p95Decode} maxDecodeMs=${Math.round(Math.max(0, ...runningStats.decodeDurationsMs))}`,
+    `avgSampleIntervalMs=${sampleAvg.toFixed(1)} p95SampleIntervalMs=${p95Sample} maxSampleIntervalMs=${Math.round(maxValue(sampleIntervals))}`,
+    `avgDecodeMs=${decodeAvg.toFixed(1)} p95DecodeMs=${p95Decode} maxDecodeMs=${Math.round(maxValue(decodeDurations))}`,
     `queueDepthMax=${ingest.queueDepthMax} queueWaitAvgMs=${ingest.queueWaitAvgMs.toFixed(1)} queueWaitP95Ms=${ingest.queueWaitP95Ms}`,
     `ingestDurationAvgMs=${ingest.ingestDurationAvgMs.toFixed(1)} ingestDurationP95Ms=${ingest.ingestDurationP95Ms}`,
     `headerAcceptedAt=${sessionLifecycleLog.headerAcceptedAt} headerRepeatedCount=${sessionLifecycleLog.headerRepeatedCount}`,
@@ -403,6 +442,8 @@ function buildFailureSnapshot(snapshot: ReceiverSnapshot): string {
 function formatScanLoopDiagnostics(snapshot: ReceiverSnapshot): string {
   const ingest = receiverIngest.getDiagnostics();
   const dim = `${video.videoWidth || 0}x${video.videoHeight || 0}`;
+  const sampleIntervals = runningStats.sampleIntervalsMs.values();
+  const decodeDurations = runningStats.decodeDurationsMs.values();
   const decodeHitRate = scanLoopDiagnostics.decodeAttempts > 0
     ? Math.round((scanLoopDiagnostics.decodeHits / scanLoopDiagnostics.decodeAttempts) * 100)
     : 0;
@@ -414,9 +455,9 @@ function formatScanLoopDiagnostics(snapshot: ReceiverSnapshot): string {
     `cameraReadyState=${video.readyState} video=${dim}`,
     `loopTicks=${scanLoopDiagnostics.loopTicks} throttled=${scanLoopDiagnostics.throttledTicks} lagSpikes=${scanLoopDiagnostics.lagSpikes} maxLoopDeltaMs=${scanLoopDiagnostics.maxLoopDeltaMs}`,
     `decodeAttempts=${scanLoopDiagnostics.decodeAttempts} hits=${scanLoopDiagnostics.decodeHits} hitRate=${decodeHitRate}% noQrFound=${scanLoopDiagnostics.noQrFound} geometryRejected=${scanLoopDiagnostics.geometryRejected}` ,
-    `funnel sampled=${decodeFunnelCounters.sampledFrames} noQr=${decodeFunnelCounters.noQrDetected} qrDetected=${decodeFunnelCounters.qrDetected} geometryRejected=${decodeFunnelCounters.geometryRejected} protocolMagicRejected=${decodeFunnelCounters.protocolMagicRejected} parseRejected=${decodeFunnelCounters.parseRejected} armingWindowRejected=${decodeFunnelCounters.armingWindowRejected} foreignTransferRejected=${decodeFunnelCounters.foreignTransferRejected} packetCrcRejected=${decodeFunnelCounters.packetCrcRejected} duplicateScannerRejected=${decodeFunnelCounters.duplicateScannerRejected} duplicatePacketRejected=${decodeFunnelCounters.duplicatePacketRejected} acceptedUnique=${decodeFunnelCounters.acceptedUnique}`,
-    `cadence sampleAttemptCount=${runningStats.sampleAttemptCount} avgSampleIntervalMs=${average(runningStats.sampleIntervalsMs).toFixed(1)} p95SampleIntervalMs=${percentile(runningStats.sampleIntervalsMs, 0.95)} maxSampleIntervalMs=${Math.round(Math.max(0, ...runningStats.sampleIntervalsMs))}` ,
-    `decodeDurationAvgMs=${average(runningStats.decodeDurationsMs).toFixed(1)} decodeDurationP95Ms=${percentile(runningStats.decodeDurationsMs, 0.95)} decodeDurationMaxMs=${Math.round(Math.max(0, ...runningStats.decodeDurationsMs))} slowDecodeFrames=${scanLoopDiagnostics.slowDecodeFrames}` ,
+    `funnel sampled=${decodeFunnelCounters.sampledFrames} decodeAttempts=${decodeFunnelCounters.decodeAttempts} noQr=${decodeFunnelCounters.noQrDetected} qrDetected=${decodeFunnelCounters.qrDetected} roiAttempts=${decodeFunnelCounters.roiDecodeAttempts} roiSuccesses=${decodeFunnelCounters.roiDecodeSuccesses} fullAttempts=${decodeFunnelCounters.fullDecodeAttempts} fullSuccesses=${decodeFunnelCounters.fullDecodeSuccesses} forcedFullFallbacks=${decodeFunnelCounters.forcedFullFallbacks} roiResets=${decodeFunnelCounters.roiResets} longestNoQrStreak=${decodePipeline.getCounters().longestNoQrStreak} longestNoUniquePacketStreak=${longestNoUniquePacketStreakSeconds}s geometryRejected=${decodeFunnelCounters.geometryRejected} protocolMagicRejected=${decodeFunnelCounters.protocolMagicRejected} parseRejected=${decodeFunnelCounters.parseRejected} armingWindowRejected=${decodeFunnelCounters.armingWindowRejected} foreignTransferRejected=${decodeFunnelCounters.foreignTransferRejected} packetCrcRejected=${decodeFunnelCounters.packetCrcRejected} duplicateScannerRejected=${decodeFunnelCounters.duplicateScannerRejected} duplicatePacketRejected=${decodeFunnelCounters.duplicatePacketRejected} acceptedUnique=${decodeFunnelCounters.acceptedUnique}`,
+    `cadence sampleAttemptCount=${runningStats.sampleAttemptCount} avgSampleIntervalMs=${average(runningStats.sampleIntervalsMs.values()).toFixed(1)} p95SampleIntervalMs=${percentile(runningStats.sampleIntervalsMs.values(), 0.95)} maxSampleIntervalMs=${Math.round(maxValue(sampleIntervals))}` ,
+    `decodeMode=${scanLoopDiagnostics.lastDecodeMode} decodeInput=${scanLoopDiagnostics.lastDecodeInputWidth}x${scanLoopDiagnostics.lastDecodeInputHeight} decodeDurationAvgMs=${average(decodeDurations).toFixed(1)} decodeDurationP95Ms=${percentile(decodeDurations, 0.95)} decodeDurationMaxMs=${Math.round(maxValue(decodeDurations))} slowDecodeFrames=${scanLoopDiagnostics.slowDecodeFrames}` ,
     `ingest: acceptedFrames=${ingest.acceptedFrames} acceptedUniquePackets=${ingest.acceptedUniquePackets} duplicateProtocolPackets=${ingest.duplicateProtocolPackets} duplicateScannerPayloads=${ingest.duplicateScannerPayloads} droppedQueued=${ingest.droppedQueuedPayloads} foreignTransferFrames=${ingest.foreignTransferFrames} badPacketCrcFrames=${ingest.badPacketCrcFrames} malformed=${ingest.malformedPayloads} queueDepthMax=${ingest.queueDepthMax} queueWaitAvgMs=${ingest.queueWaitAvgMs.toFixed(1)} queueWaitP95Ms=${ingest.queueWaitP95Ms} ingestDurationAvgMs=${ingest.ingestDurationAvgMs.toFixed(1)} ingestDurationP95Ms=${ingest.ingestDurationP95Ms} overflowDup=${ingest.overflowDropsDuplicate} overflowNonDup=${ingest.overflowDropsNonDuplicate}`,
     '--- Receiver Event Timeline ---'
   ].join('\n');
@@ -606,13 +647,13 @@ function polygonArea(points: Array<{ x: number; y: number }>): number {
   return Math.abs(sum / 2);
 }
 
-function hasStableQrGeometry(result: NonNullable<ReturnType<typeof jsQR>>, width: number, height: number): boolean {
-  const points = [
-    result.location.topLeftCorner,
-    result.location.topRightCorner,
-    result.location.bottomRightCorner,
-    result.location.bottomLeftCorner
-  ];
+function hasStableQrGeometry(geometry: DecodeGeometry | null, width: number, height: number): boolean {
+  if (!geometry) {
+    stableGeometryCount = 0;
+    lastGeometry = null;
+    return false;
+  }
+  const points = geometry.corners;
   const qrArea = polygonArea(points);
   const frameArea = width * height;
   const areaRatio = frameArea > 0 ? qrArea / frameArea : 0;
@@ -746,6 +787,7 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
       successSoundPlayed = true;
       playDing();
     }
+    decodePipeline.resetForTerminalState();
     if (snapshot.fileName && snapshot.fileBytes) {
       lastPacketEl.textContent = `${snapshot.fileName} • ${snapshot.fileBytes.length} bytes`;
     }
@@ -772,6 +814,7 @@ function applySnapshot(snapshot: ReceiverSnapshot): void {
   } else {
     warningEl.textContent = snapshot.error?.message ?? 'Transfer failed. Restart sender and retry.';
   }
+  decodePipeline.resetForTerminalState();
   sessionLifecycleLog.failureAt = Date.now();
   appendDebugEvent(`Transfer failed: ${code ?? 'UNKNOWN'}${snapshot.error?.message ? ` (${snapshot.error.message})` : ''}`);
   appendDebugEvent(buildFailureSnapshot(snapshot), true);
@@ -794,18 +837,20 @@ function resetUiForNewScan(): void {
   lastProtocolFrameSeenAt = 0;
   previousDiscoveryScanCount = 0;
   lastReceivedTimeEl.textContent = 'Last packet: -';
+  decodePipeline.resetForFreshAttempt();
   stableGeometryCount = 0;
   lastGeometry = null;
   lockStatusEl.textContent = 'Waiting for initial QR';
   progressHealthEl.textContent = 'Progress health: waiting for initial QR…';
   diagnosticHintEl.textContent = 'Diagnostics: waiting for scan data.';
   debugEventLines.length = 0;
-  decodeFunnelCounters = { sampledFrames: 0, noQrDetected: 0, qrDetected: 0, geometryRejected: 0, protocolMagicRejected: 0, parseRejected: 0, armingWindowRejected: 0, foreignTransferRejected: 0, packetCrcRejected: 0, duplicateScannerRejected: 0, duplicatePacketRejected: 0, acceptedUnique: 0 };
+  decodeFunnelCounters = { sampledFrames: 0, noQrDetected: 0, qrDetected: 0, decodeAttempts: 0, roiDecodeAttempts: 0, roiDecodeSuccesses: 0, fullDecodeAttempts: 0, fullDecodeSuccesses: 0, forcedFullFallbacks: 0, roiResets: 0, geometryRejected: 0, protocolMagicRejected: 0, parseRejected: 0, armingWindowRejected: 0, foreignTransferRejected: 0, packetCrcRejected: 0, duplicateScannerRejected: 0, duplicatePacketRejected: 0, acceptedUnique: 0 };
   sessionLifecycleLog = { scanStartedAt: Date.now(), headerAcceptedAt: null, headerRepeatedCount: 0, firstAcceptedDataIndex: null, firstAcceptedDataAt: null, endSeenAt: null, failureAt: null };
-  runningStats = { sampleIntervalsMs: [], decodeDurationsMs: [], sampleAttemptCount: 0, longestDuplicateStreak: 0, duplicateStreak: 0, duplicateBeforeEnd: 0, duplicateAfterEnd: 0 };
+  runningStats = { sampleIntervalsMs: new RingBuffer<number>(METRICS_SAMPLE_CAP), decodeDurationsMs: new RingBuffer<number>(METRICS_SAMPLE_CAP), sampleAttemptCount: 0, longestDuplicateStreak: 0, duplicateStreak: 0, duplicateBeforeEnd: 0, duplicateAfterEnd: 0 };
   duplicatePacketHistogram.clear();
   lastSampleAttemptAtMs = 0;
   previousAcceptedReceivedCount = 0;
+  longestNoUniquePacketStreakSeconds = 0;
   scanLoopDiagnostics = {
     loopTicks: 0,
     throttledTicks: 0,
@@ -821,7 +866,10 @@ function resetUiForNewScan(): void {
     snapshotUpdates: 0,
     slowDecodeFrames: 0,
     maxDecodeMs: 0,
-    lastLoopAtMs: null
+    lastLoopAtMs: null,
+    lastDecodeMode: 'full',
+    lastDecodeInputWidth: 0,
+    lastDecodeInputHeight: 0
   };
   debugLogOutput.textContent = 'No events yet.';
   appendDebugEvent('Scan started');
@@ -864,9 +912,8 @@ function processFrame(now: number): void {
   frameCanvas.width = video.videoWidth;
   frameCanvas.height = video.videoHeight;
   frameContext.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
-  const image = frameContext.getImageData(0, 0, frameCanvas.width, frameCanvas.height);
-  scanLoopDiagnostics.decodeAttempts += 1;
-  const result = jsQR(image.data, image.width, image.height);
+  const nowMs = Date.now();
+  const decodeAttempt = decodePipeline.decode(frameCanvas, frameCanvas.width, frameCanvas.height, receiverMachine.snapshot.lockConfirmed, nowMs);
   const decodeElapsedMs = Math.round(performance.now() - decodeStartedAt);
   runningStats.decodeDurationsMs.push(decodeElapsedMs);
   scanLoopDiagnostics.maxDecodeMs = Math.max(scanLoopDiagnostics.maxDecodeMs, decodeElapsedMs);
@@ -874,18 +921,31 @@ function processFrame(now: number): void {
     scanLoopDiagnostics.slowDecodeFrames += 1;
   }
 
-  if (!result?.binaryData?.length) {
-    scanLoopDiagnostics.noQrFound += 1;
-    decodeFunnelCounters.noQrDetected += 1;
+  scanLoopDiagnostics.lastDecodeMode = decodeAttempt.mode;
+  scanLoopDiagnostics.lastDecodeInputWidth = decodeAttempt.inputWidth;
+  scanLoopDiagnostics.lastDecodeInputHeight = decodeAttempt.inputHeight;
+
+  const pipelineCounters = decodePipeline.getCounters();
+  scanLoopDiagnostics.decodeAttempts = pipelineCounters.decodeAttempts;
+  scanLoopDiagnostics.decodeHits = pipelineCounters.qrDetected;
+  scanLoopDiagnostics.noQrFound = pipelineCounters.noQrFound;
+  decodeFunnelCounters.decodeAttempts = pipelineCounters.decodeAttempts;
+  decodeFunnelCounters.noQrDetected = pipelineCounters.noQrFound;
+  decodeFunnelCounters.qrDetected = pipelineCounters.qrDetected;
+  decodeFunnelCounters.roiDecodeAttempts = pipelineCounters.roiDecodeAttempts;
+  decodeFunnelCounters.roiDecodeSuccesses = pipelineCounters.roiDecodeSuccesses;
+  decodeFunnelCounters.fullDecodeAttempts = pipelineCounters.fullDecodeAttempts;
+  decodeFunnelCounters.fullDecodeSuccesses = pipelineCounters.fullDecodeSuccesses;
+  decodeFunnelCounters.forcedFullFallbacks = pipelineCounters.forcedFullFallbacks;
+  decodeFunnelCounters.roiResets = pipelineCounters.roiResets;
+
+  if (!decodeAttempt.decodeResult) {
     rafId = requestAnimationFrame(processFrame);
     return;
   }
 
-  scanLoopDiagnostics.decodeHits += 1;
-  decodeFunnelCounters.qrDetected += 1;
   {
-    const nowMs = Date.now();
-    const rawPayload = Uint8Array.from(result.binaryData);
+    const rawPayload = decodeAttempt.decodeResult.payload;
     if (!isProtocolPayload(rawPayload)) {
       scanLoopDiagnostics.protocolMagicRejected += 1;
       decodeFunnelCounters.protocolMagicRejected += 1;
@@ -905,7 +965,7 @@ function processFrame(now: number): void {
       return;
     }
 
-    const geometryDecision = shouldProcessParsedFrameWithGeometry(hasStableQrGeometry(result, image.width, image.height));
+    const geometryDecision = shouldProcessParsedFrameWithGeometry(hasStableQrGeometry(decodeAttempt.decodeResult.geometry, frameCanvas.width, frameCanvas.height));
     if (geometryDecision.geometryRejected) {
       scanLoopDiagnostics.geometryRejected += 1;
       decodeFunnelCounters.geometryRejected += 1;
@@ -921,6 +981,17 @@ function processFrame(now: number): void {
         rafId = requestAnimationFrame(processFrame);
         return;
       }
+
+      decodePipeline.noteSuccessfulProtocolDecode(
+        decodeAttempt.trackingHint,
+        {
+          lockConfirmed: machineSnapshot.lockConfirmed,
+          activeTransferId: machineSnapshot.transferId,
+          frameTransferId: transferIdToHex(parsedFrame.transferId)
+        },
+        nowMs
+      );
+
       scanLoopDiagnostics.enqueueCalls += 1;
       void receiverIngest.enqueue(rawPayload, nowMs, parsedFrame).then((snapshot) => {
         if (snapshot) {
@@ -975,6 +1046,9 @@ function updateSignalHealth(): void {
 
   const uniqueReference = snapshot.lastUniquePacketAt ?? snapshot.headerLockedAt ?? snapshot.scanStartedAt ?? scanStartedAt;
   const sinceLastUniqueSeconds = uniqueReference > 0 ? Math.max(0, Math.floor((now - uniqueReference) / 1000)) : null;
+  if (sinceLastUniqueSeconds !== null) {
+    longestNoUniquePacketStreakSeconds = Math.max(longestNoUniquePacketStreakSeconds, sinceLastUniqueSeconds);
+  }
 
   let timeoutText = 'Progress timeout inactive';
   if (snapshot.lastUniquePacketAt) {
@@ -1084,6 +1158,7 @@ scanButton.addEventListener('click', async () => {
   if (activeStream) {
     stopScanLoop(true);
     receiverMachine.reset();
+    decodePipeline.resetForFreshAttempt();
     isSessionPaused = false;
     pauseSessionButton.textContent = 'Pause Session';
     applySnapshot(receiverMachine.snapshot);
@@ -1153,5 +1228,6 @@ window.addEventListener('beforeunload', () => {
 
 setTheme(localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark');
 receiverMachine.reset();
+decodePipeline.resetForFreshAttempt();
 applySnapshot(receiverMachine.snapshot);
 void populateCameraOptions();
