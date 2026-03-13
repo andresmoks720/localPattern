@@ -127,6 +127,28 @@ describe('ReceiverIngestService', () => {
     expect(diagnostics.acceptedFrames).toBe(RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS);
   });
 
+  it('accepts immediate DATA after lock-confirming HEADER sequence', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({ machine });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'post-lock.bin', maxPayloadSize: 2, includeEndFrame: true });
+    const headerPayload = assembleFrame(transfer.header);
+
+    for (let i = 0; i < RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS - 1; i += 1) {
+      service.ingest(headerPayload, 1000 + i);
+    }
+    expect(machine.snapshot.lockConfirmed).toBe(false);
+
+    service.ingest(headerPayload, 1000 + RECEIVER_LOCK_CONFIRMATION.REQUIRED_HEADERS);
+    expect(machine.snapshot.lockConfirmed).toBe(true);
+
+    service.ingest(assembleFrame(transfer.dataFrames[0]), 2000);
+
+    expect(machine.snapshot.receivedCount).toBe(1);
+    expect(machine.snapshot.lastUniquePacketAt).toBe(2000);
+  });
+
 
 
   it('does not drop out-of-order data sequence numbers for locked session', () => {
