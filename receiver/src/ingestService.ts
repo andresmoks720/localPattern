@@ -1,6 +1,6 @@
 import { FRAME_TYPE_DATA, FRAME_TYPE_HEADER, MAGIC_BYTES, PROTOCOL_ERROR_CODES, ProtocolError, parseFrame, type ReceiverMachine, type ReceiverSnapshot, type TransferFrame } from '@qr-data-bridge/protocol';
 
-const DEFAULT_SCANNER_DEDUPE_WINDOW_MS = 4000;
+const DEFAULT_SCANNER_DEDUPE_WINDOW_MS = 250;
 const DEFAULT_MAX_PENDING_INGESTIONS = 64;
 
 export interface ReceiverIngestDiagnostics {
@@ -12,6 +12,8 @@ export interface ReceiverIngestDiagnostics {
   badPacketCrcFrames: number;
   foreignTransferFrames: number;
   acceptedFrames: number;
+  acceptedUniquePackets: number;
+  duplicateProtocolPackets: number;
   finalizeDurationMs: number | null;
   droppedQueuedPayloads: number;
 }
@@ -75,6 +77,8 @@ export class ReceiverIngestService {
     badPacketCrcFrames: 0,
     foreignTransferFrames: 0,
     acceptedFrames: 0,
+    acceptedUniquePackets: 0,
+    duplicateProtocolPackets: 0,
     finalizeDurationMs: null,
     droppedQueuedPayloads: 0
   };
@@ -111,6 +115,8 @@ export class ReceiverIngestService {
       badPacketCrcFrames: 0,
       foreignTransferFrames: 0,
       acceptedFrames: 0,
+      acceptedUniquePackets: 0,
+      duplicateProtocolPackets: 0,
       finalizeDurationMs: null,
       droppedQueuedPayloads: 0
     };
@@ -230,6 +236,13 @@ export class ReceiverIngestService {
       const snapshot = this.deps.machine.applyFrame(frame, now);
 
       this.diagnosticsValue.acceptedFrames += 1;
+      if (frame.frameType === FRAME_TYPE_DATA) {
+        if (snapshot.receivedCount > before.receivedCount) {
+          this.diagnosticsValue.acceptedUniquePackets += 1;
+        } else if (before.lockConfirmed) {
+          this.diagnosticsValue.duplicateProtocolPackets += 1;
+        }
+      }
       this.firstAcceptedAt = this.firstAcceptedAt ?? now;
       this.deps.onEvent?.({ type: 'frameAccepted', frame, snapshot, tuple });
 

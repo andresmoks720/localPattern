@@ -2,9 +2,6 @@ import './style.css';
 import jsQR from 'jsqr';
 import {
   ReceiverMachine,
-  FRAME_TYPE_DATA,
-  FRAME_TYPE_END,
-  FRAME_TYPE_HEADER,
   MAGIC_BYTES,
   RECEIVER_ERROR_CODES,
   RECEIVER_LOCK_CONFIRMATION,
@@ -13,10 +10,9 @@ import {
   type ReceiverSnapshot
 } from '@qr-data-bridge/protocol';
 import { ReceiverIngestService } from './ingestService';
+import { selectScanIntervalMs, shouldProcessParsedFrameWithGeometry } from './scanPolicy';
 
-const SCAN_INTERVAL_MS = 300;
 const SIGNAL_LOST_MS = 5000;
-const ARMING_WINDOW_MS = 2000;
 const MIN_QR_AREA_RATIO = 0.015;
 const MAX_AREA_DRIFT_RATIO = 0.4;
 const MAX_ASPECT_DRIFT_RATIO = 0.25;
@@ -160,7 +156,6 @@ let soundEnabled = false;
 let successSoundPlayed = false;
 let ingestDecodeError: string | null = null;
 let selectedCameraId = '';
-let armingWindowEndsAt = 0;
 let stableGeometryCount = 0;
 let lastGeometry: { areaRatio: number; aspectRatio: number; centerX: number; centerY: number } | null = null;
 let debugLogEnabled = false;
@@ -173,10 +168,10 @@ interface ScanLoopDiagnostics {
   maxLoopDeltaMs: number;
   decodeAttempts: number;
   decodeHits: number;
+  noQrFound: number;
   geometryRejected: number;
-  nonProtocolPayloads: number;
-  parseFailures: number;
-  armingWindowDrops: number;
+  protocolMagicRejected: number;
+  parseRejected: number;
   enqueueCalls: number;
   snapshotUpdates: number;
   slowDecodeFrames: number;
@@ -191,10 +186,10 @@ let scanLoopDiagnostics: ScanLoopDiagnostics = {
   maxLoopDeltaMs: 0,
   decodeAttempts: 0,
   decodeHits: 0,
+  noQrFound: 0,
   geometryRejected: 0,
-  nonProtocolPayloads: 0,
-  parseFailures: 0,
-  armingWindowDrops: 0,
+  protocolMagicRejected: 0,
+  parseRejected: 0,
   enqueueCalls: 0,
   snapshotUpdates: 0,
   slowDecodeFrames: 0,
@@ -236,10 +231,10 @@ function formatScanLoopDiagnostics(snapshot: ReceiverSnapshot): string {
     `received=${snapshot.receivedCount}/${snapshot.totalPackets ?? 0} missingRanges=${formatMissingRanges(snapshot, 8)}`,
     `cameraReadyState=${video.readyState} video=${dim}`,
     `loopTicks=${scanLoopDiagnostics.loopTicks} throttled=${scanLoopDiagnostics.throttledTicks} lagSpikes=${scanLoopDiagnostics.lagSpikes} maxLoopDeltaMs=${scanLoopDiagnostics.maxLoopDeltaMs}`,
-    `decodeAttempts=${scanLoopDiagnostics.decodeAttempts} hits=${scanLoopDiagnostics.decodeHits} hitRate=${decodeHitRate}% geometryRejected=${scanLoopDiagnostics.geometryRejected}`,
-    `nonProtocol=${scanLoopDiagnostics.nonProtocolPayloads} parseFailures=${scanLoopDiagnostics.parseFailures} armingDrops=${scanLoopDiagnostics.armingWindowDrops}`,
+    `decodeAttempts=${scanLoopDiagnostics.decodeAttempts} hits=${scanLoopDiagnostics.decodeHits} hitRate=${decodeHitRate}% noQrFound=${scanLoopDiagnostics.noQrFound} geometryRejected=${scanLoopDiagnostics.geometryRejected}`,
+    `protocolMagicRejected=${scanLoopDiagnostics.protocolMagicRejected} parseRejected=${scanLoopDiagnostics.parseRejected}`,
     `slowDecodeFrames=${scanLoopDiagnostics.slowDecodeFrames} maxDecodeMs=${scanLoopDiagnostics.maxDecodeMs}`,
-    `ingest: accepted=${ingest.acceptedFrames} dup=${ingest.duplicateScannerPayloads} droppedQueued=${ingest.droppedQueuedPayloads} foreign=${ingest.foreignTransferFrames} badCrc=${ingest.badPacketCrcFrames} malformed=${ingest.malformedPayloads}`,
+    `ingest: acceptedFrames=${ingest.acceptedFrames} acceptedUniquePackets=${ingest.acceptedUniquePackets} duplicateProtocolPackets=${ingest.duplicateProtocolPackets} duplicateScannerPayloads=${ingest.duplicateScannerPayloads} droppedQueued=${ingest.droppedQueuedPayloads} foreignTransferFrames=${ingest.foreignTransferFrames} badPacketCrcFrames=${ingest.badPacketCrcFrames} malformed=${ingest.malformedPayloads}`,
     '--- Receiver Event Timeline ---'
   ].join('\n');
 }
@@ -368,7 +363,7 @@ function updateProgress(snapshot: ReceiverSnapshot): void {
   }
 
   const diagnostics = receiverIngest.getDiagnostics();
-  scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets • dup:${diagnostics.duplicateScannerPayloads} queuedDrop:${diagnostics.droppedQueuedPayloads} foreign:${diagnostics.foreignTransferFrames} badCrc:${diagnostics.badPacketCrcFrames} malformed:${diagnostics.malformedPayloads}`;
+  scanStatsEl.textContent = `Received ${snapshot.totalScans} scans → ${received} unique packets • acceptedFrames:${diagnostics.acceptedFrames} acceptedUniquePackets:${diagnostics.acceptedUniquePackets} duplicateProtocolPackets:${diagnostics.duplicateProtocolPackets} duplicateScannerPayloads:${diagnostics.duplicateScannerPayloads}`;
 
   if (diagnostics.foreignTransferFrames > 0) {
     diagnosticHintEl.textContent = 'Hint: multiple senders/QR streams detected. Keep only one sender QR visible.';
@@ -580,7 +575,6 @@ function resetUiForNewScan(): void {
   lastProtocolFrameSeenAt = 0;
   previousDiscoveryScanCount = 0;
   lastReceivedTimeEl.textContent = 'Last packet: -';
-  armingWindowEndsAt = Date.now() + ARMING_WINDOW_MS;
   stableGeometryCount = 0;
   lastGeometry = null;
   lockStatusEl.textContent = 'Searching for start frame...';
@@ -594,10 +588,10 @@ function resetUiForNewScan(): void {
     maxLoopDeltaMs: 0,
     decodeAttempts: 0,
     decodeHits: 0,
+    noQrFound: 0,
     geometryRejected: 0,
-    nonProtocolPayloads: 0,
-    parseFailures: 0,
-    armingWindowDrops: 0,
+    protocolMagicRejected: 0,
+    parseRejected: 0,
     enqueueCalls: 0,
     snapshotUpdates: 0,
     slowDecodeFrames: 0,
@@ -626,7 +620,8 @@ function processFrame(now: number): void {
     return;
   }
 
-  if (now - lastScanAt < SCAN_INTERVAL_MS) {
+  const scanIntervalMs = selectScanIntervalMs(receiverMachine.snapshot.lockConfirmed);
+  if (now - lastScanAt < scanIntervalMs) {
     scanLoopDiagnostics.throttledTicks += 1;
     rafId = requestAnimationFrame(processFrame);
     return;
@@ -646,20 +641,19 @@ function processFrame(now: number): void {
     scanLoopDiagnostics.slowDecodeFrames += 1;
   }
 
-  if (result?.binaryData?.length) {
-    scanLoopDiagnostics.decodeHits += 1;
-    if (!hasStableQrGeometry(result, image.width, image.height)) {
-      scanLoopDiagnostics.geometryRejected += 1;
-      maybeLogCounterMilestone('Geometry-rejected QR detections', scanLoopDiagnostics.geometryRejected, 5);
-      rafId = requestAnimationFrame(processFrame);
-      return;
-    }
+  if (!result?.binaryData?.length) {
+    scanLoopDiagnostics.noQrFound += 1;
+    rafId = requestAnimationFrame(processFrame);
+    return;
+  }
 
+  scanLoopDiagnostics.decodeHits += 1;
+  {
     const nowMs = Date.now();
     const rawPayload = Uint8Array.from(result.binaryData);
     if (!isProtocolPayload(rawPayload)) {
-      scanLoopDiagnostics.nonProtocolPayloads += 1;
-      maybeLogCounterMilestone('Non-protocol QR payloads', scanLoopDiagnostics.nonProtocolPayloads, 5);
+      scanLoopDiagnostics.protocolMagicRejected += 1;
+      maybeLogCounterMilestone('Protocol magic-rejected QR payloads', scanLoopDiagnostics.protocolMagicRejected, 5);
       rafId = requestAnimationFrame(processFrame);
       return;
     }
@@ -668,31 +662,31 @@ function processFrame(now: number): void {
     try {
       parsedFrame = parseFrame(rawPayload);
     } catch {
-      scanLoopDiagnostics.parseFailures += 1;
-      maybeLogCounterMilestone('Protocol parse failures', scanLoopDiagnostics.parseFailures, 3);
+      scanLoopDiagnostics.parseRejected += 1;
+      maybeLogCounterMilestone('Protocol parse rejections', scanLoopDiagnostics.parseRejected, 3);
       rafId = requestAnimationFrame(processFrame);
       return;
+    }
+
+    const geometryDecision = shouldProcessParsedFrameWithGeometry(hasStableQrGeometry(result, image.width, image.height));
+    if (geometryDecision.geometryRejected) {
+      scanLoopDiagnostics.geometryRejected += 1;
+      maybeLogCounterMilestone('Geometry-rejected QR detections', scanLoopDiagnostics.geometryRejected, 5);
     }
 
     lastProtocolFrameSeenAt = nowMs;
 
-    const inArmingWindow = nowMs < armingWindowEndsAt;
-    if (inArmingWindow && (parsedFrame.frameType === FRAME_TYPE_DATA || parsedFrame.frameType === FRAME_TYPE_END)) {
-      scanLoopDiagnostics.armingWindowDrops += 1;
-      maybeLogCounterMilestone('Arming-window drops', scanLoopDiagnostics.armingWindowDrops, 3);
-      rafId = requestAnimationFrame(processFrame);
-      return;
+    if (geometryDecision.shouldProcess) {
+      scanLoopDiagnostics.enqueueCalls += 1;
+      void receiverIngest.enqueue(rawPayload, nowMs, parsedFrame).then((snapshot) => {
+        if (snapshot) {
+          scanLoopDiagnostics.snapshotUpdates += 1;
+          applySnapshot(snapshot);
+        } else if (ingestDecodeError) {
+          warningEl.textContent = `Decode error: ${ingestDecodeError}`;
+        }
+      });
     }
-
-    scanLoopDiagnostics.enqueueCalls += 1;
-    void receiverIngest.enqueue(rawPayload, nowMs, parsedFrame).then((snapshot) => {
-      if (snapshot) {
-        scanLoopDiagnostics.snapshotUpdates += 1;
-        applySnapshot(snapshot);
-      } else if (ingestDecodeError) {
-        warningEl.textContent = `Decode error: ${ingestDecodeError}`;
-      }
-    });
   }
 
   rafId = requestAnimationFrame(processFrame);

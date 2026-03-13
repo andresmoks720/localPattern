@@ -71,13 +71,42 @@ describe('ReceiverIngestService', () => {
       payload: transfer.dataFrames[0].payload.slice()
     };
     const dataPayload1DifferentWrapper = assembleFrame(remappedFrame);
-    service.ingest(dataPayload1DifferentWrapper, 6000);
+    service.ingest(dataPayload1DifferentWrapper, 1300);
 
     const diagnostics = service.getDiagnostics();
     expect(diagnostics.totalPayloadsSeen).toBe(6);
     expect(diagnostics.duplicateScannerPayloads).toBe(1);
+    expect(diagnostics.duplicateProtocolPackets).toBe(1);
+    expect(diagnostics.acceptedUniquePackets).toBe(1);
     expect(diagnostics.acceptedFrames).toBe(5);
     expect(events).toContain('duplicateScannerPayload');
+  });
+
+  it('ignores DATA before HEADER without requiring any time-based arming window', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({ machine });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'order.bin', maxPayloadSize: 2, includeEndFrame: true });
+    service.ingest(assembleFrame(transfer.dataFrames[0]), 1000);
+
+    expect(machine.snapshot.lockConfirmed).toBe(false);
+    expect(machine.snapshot.receivedCount).toBe(0);
+  });
+
+  it('ignores END before HEADER', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({ machine });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'order.bin', maxPayloadSize: 2, includeEndFrame: true });
+    if (!transfer.endFrame) {
+      throw new Error('Expected END frame in fixture transfer');
+    }
+    service.ingest(assembleFrame(transfer.endFrame), 1000);
+
+    expect(machine.snapshot.lockConfirmed).toBe(false);
+    expect(machine.snapshot.endSeenAt).toBeNull();
   });
 
   it('tracks foreign transfer frames ignored after lock', () => {
@@ -322,6 +351,24 @@ describe('ReceiverIngestService', () => {
 
     expect(snapshot.lastUniquePacketAt).toBe(uniqueAt);
     expect(snapshot.lastLockedTransferFrameAt).toBe(1011);
+  });
+
+  it('allows repeated payload after scanner dedupe window elapses while protocol dedupe still blocks unique growth', () => {
+    const machine = new ReceiverMachine();
+    machine.startScanning();
+    const service = new ReceiverIngestService({ machine, scannerDedupeWindowMs: 250 });
+
+    const transfer = chunkFile(new Uint8Array([1, 2, 3, 4]), { fileName: 'dedupe.bin', maxPayloadSize: 2, includeEndFrame: true });
+    ingestHeaderConfirmations(service, assembleFrame(transfer.header), 1000);
+
+    const dataPayload = assembleFrame(transfer.dataFrames[0]);
+    service.ingest(dataPayload, 1200);
+    service.ingest(dataPayload, 1600);
+
+    const diagnostics = service.getDiagnostics();
+    expect(diagnostics.duplicateScannerPayloads).toBe(0);
+    expect(diagnostics.duplicateProtocolPackets).toBe(1);
+    expect(diagnostics.acceptedUniquePackets).toBe(1);
   });
 
   it('uses parsed frame from scan pipeline when enqueuing', async () => {
