@@ -16,11 +16,18 @@ export interface ReceiverIngestDiagnostics {
   duplicateProtocolPackets: number;
   finalizeDurationMs: number | null;
   droppedQueuedPayloads: number;
+  queueDepthMax: number;
+  queueWaitAvgMs: number;
+  queueWaitP95Ms: number;
+  ingestDurationAvgMs: number;
+  ingestDurationP95Ms: number;
+  overflowDropsDuplicate: number;
+  overflowDropsNonDuplicate: number;
 }
 
 export type ReceiverIngestEvent =
   | { type: 'frameAccepted'; frame: TransferFrame; snapshot: ReceiverSnapshot; tuple: FrameTuple }
-  | { type: 'frameDropped'; reason: 'duplicateScannerPayload' | 'foreignTransferFrame' | 'replayedSequence'; tuple: FrameTuple }
+  | { type: 'frameDropped'; reason: 'duplicateScannerPayload' | 'foreignTransferFrame' | 'replayedSequence' | 'queueOverflow'; tuple: FrameTuple | null }
   | { type: 'decodeError'; message: string }
   | { type: 'duplicateScannerPayload' }
   | { type: 'foreignFrameIgnored' }
@@ -36,6 +43,7 @@ interface FrameTuple {
 interface PendingIngestion {
   rawPayload: Uint8Array;
   now: number;
+  enqueuedAt: number;
   dedupeKey: string;
   parsedFrame: TransferFrame | null;
 }
@@ -68,6 +76,14 @@ export class ReceiverIngestService {
 
   private firstAcceptedAt: number | null = null;
 
+  private readonly queueWaitSamples: number[] = [];
+
+  private readonly ingestDurationSamples: number[] = [];
+
+  private queueWaitSumMs = 0;
+
+  private ingestDurationSumMs = 0;
+
   private diagnosticsValue: ReceiverIngestDiagnostics = {
     totalPayloadsSeen: 0,
     nonProtocolPayloads: 0,
@@ -80,7 +96,14 @@ export class ReceiverIngestService {
     acceptedUniquePackets: 0,
     duplicateProtocolPackets: 0,
     finalizeDurationMs: null,
-    droppedQueuedPayloads: 0
+    droppedQueuedPayloads: 0,
+    queueDepthMax: 0,
+    queueWaitAvgMs: 0,
+    queueWaitP95Ms: 0,
+    ingestDurationAvgMs: 0,
+    ingestDurationP95Ms: 0,
+    overflowDropsDuplicate: 0,
+    overflowDropsNonDuplicate: 0
   };
 
   private ingestionChain: Promise<ReceiverSnapshot | null> = Promise.resolve(null);
@@ -105,6 +128,10 @@ export class ReceiverIngestService {
     this.firstAcceptedAt = null;
     this.pendingIngestions.length = 0;
     this.pendingKeyToIndex.clear();
+    this.queueWaitSamples.length = 0;
+    this.ingestDurationSamples.length = 0;
+    this.queueWaitSumMs = 0;
+    this.ingestDurationSumMs = 0;
     this.ingestionChain = Promise.resolve(null);
     this.diagnosticsValue = {
       totalPayloadsSeen: 0,
@@ -118,7 +145,14 @@ export class ReceiverIngestService {
       acceptedUniquePackets: 0,
       duplicateProtocolPackets: 0,
       finalizeDurationMs: null,
-      droppedQueuedPayloads: 0
+      droppedQueuedPayloads: 0,
+      queueDepthMax: 0,
+      queueWaitAvgMs: 0,
+      queueWaitP95Ms: 0,
+      ingestDurationAvgMs: 0,
+      ingestDurationP95Ms: 0,
+      overflowDropsDuplicate: 0,
+      overflowDropsNonDuplicate: 0
     };
   }
 
@@ -166,25 +200,40 @@ export class ReceiverIngestService {
       const [removed] = this.pendingIngestions.splice(dropIndex, 1);
       if (removed) {
         this.pendingKeyToIndex.delete(removed.dedupeKey);
+        if (removed.dedupeKey === dedupeKey) {
+          this.diagnosticsValue.overflowDropsDuplicate += 1;
+        } else {
+          this.diagnosticsValue.overflowDropsNonDuplicate += 1;
+        }
+        this.deps.onEvent?.({ type: 'frameDropped', reason: 'queueOverflow', tuple: null });
       }
       this.reindexPendingKeysFrom(dropIndex);
       this.diagnosticsValue.droppedQueuedPayloads += 1;
     }
-    this.pendingIngestions.push({ rawPayload, now, dedupeKey, parsedFrame });
+    this.pendingIngestions.push({ rawPayload, now, enqueuedAt: Date.now(), dedupeKey, parsedFrame });
     this.pendingKeyToIndex.set(dedupeKey, this.pendingIngestions.length - 1);
+    this.diagnosticsValue.queueDepthMax = Math.max(this.diagnosticsValue.queueDepthMax, this.pendingIngestions.length);
 
     this.ingestionChain = this.ingestionChain.then(async () => {
       const next = this.pendingIngestions.shift();
       if (!next) return null;
       this.pendingKeyToIndex.delete(next.dedupeKey);
       this.reindexPendingKeysFrom(0);
-      return this.ingestNow(next.rawPayload, next.now, next.parsedFrame);
+      const queueWaitMs = Math.max(0, Date.now() - next.enqueuedAt);
+      this.recordQueueWait(queueWaitMs);
+      const ingestStartedAt = Date.now();
+      const snapshot = this.ingestNow(next.rawPayload, next.now, next.parsedFrame);
+      this.recordIngestDuration(Math.max(0, Date.now() - ingestStartedAt));
+      return snapshot;
     });
     return this.ingestionChain;
   }
 
   public ingest(rawPayload: Uint8Array, now: number): ReceiverSnapshot | null {
-    return this.ingestNow(rawPayload, now);
+    const startedAt = Date.now();
+    const snapshot = this.ingestNow(rawPayload, now);
+    this.recordIngestDuration(Math.max(0, Date.now() - startedAt));
+    return snapshot;
   }
 
   private ingestNow(rawPayload: Uint8Array, now: number, parsedFrame: TransferFrame | null = null): ReceiverSnapshot | null {
@@ -269,6 +318,21 @@ export class ReceiverIngestService {
     }
   }
 
+
+  private recordQueueWait(waitMs: number): void {
+    this.queueWaitSamples.push(waitMs);
+    this.queueWaitSumMs += waitMs;
+    this.diagnosticsValue.queueWaitAvgMs = this.queueWaitSumMs / this.queueWaitSamples.length;
+    this.diagnosticsValue.queueWaitP95Ms = percentile(this.queueWaitSamples, 0.95);
+  }
+
+  private recordIngestDuration(durationMs: number): void {
+    this.ingestDurationSamples.push(durationMs);
+    this.ingestDurationSumMs += durationMs;
+    this.diagnosticsValue.ingestDurationAvgMs = this.ingestDurationSumMs / this.ingestDurationSamples.length;
+    this.diagnosticsValue.ingestDurationP95Ms = percentile(this.ingestDurationSamples, 0.95);
+  }
+
   private isProtocolPayload(rawPayload: Uint8Array): boolean {
     return rawPayload.length > 5 && MAGIC_BYTES.every((byte, index) => rawPayload[index] === byte);
   }
@@ -310,6 +374,13 @@ export class ReceiverIngestService {
 
     return 0;
   }
+}
+
+function percentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+  return sorted[index];
 }
 
 function frameTuple(frame: TransferFrame): FrameTuple {

@@ -49,6 +49,9 @@ export interface ReceiverSnapshot {
   fileCrc32: number | null;
   receivedCount: number;
   totalScans: number;
+  scanStartedAt: number | null;
+  headerLockedAt: number | null;
+  lastMatchingFrameAt: number | null;
   lastUniquePacketAt: number | null;
   lastLockedTransferFrameAt: number | null;
   endSeenAt: number | null;
@@ -115,6 +118,9 @@ export class ReceiverMachine {
     fileCrc32: null,
     receivedCount: 0,
     totalScans: 0,
+    scanStartedAt: null,
+    headerLockedAt: null,
+    lastMatchingFrameAt: null,
     lastUniquePacketAt: null,
     lastLockedTransferFrameAt: null,
     endSeenAt: null,
@@ -146,6 +152,7 @@ export class ReceiverMachine {
   public startScanning(): void {
     this.reset();
     this.setState('SCANNING');
+    this.snapshotValue.scanStartedAt = Date.now();
   }
 
   public reset(): void {
@@ -158,6 +165,9 @@ export class ReceiverMachine {
       fileCrc32: null,
       receivedCount: 0,
       totalScans: 0,
+      scanStartedAt: null,
+      headerLockedAt: null,
+      lastMatchingFrameAt: null,
       lastUniquePacketAt: null,
       lastLockedTransferFrameAt: null,
       endSeenAt: null,
@@ -189,6 +199,7 @@ export class ReceiverMachine {
     const transferId = transferIdToKey(frame.transferId);
     if (transferId !== this.snapshotValue.transferId) return;
 
+    this.snapshotValue.lastMatchingFrameAt = now;
     this.snapshotValue.lastLockedTransferFrameAt = now;
   }
 
@@ -229,8 +240,8 @@ export class ReceiverMachine {
       && this.snapshotValue.lastUniquePacketAt !== null
       && now - this.snapshotValue.lastUniquePacketAt > RECEIVER_TIMEOUTS.NO_UNIQUE_PROGRESS_TIMEOUT_MS
       && (
-        this.snapshotValue.lastLockedTransferFrameAt === null
-        || now - this.snapshotValue.lastLockedTransferFrameAt > RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
+        this.snapshotValue.lastMatchingFrameAt === null
+        || now - this.snapshotValue.lastMatchingFrameAt > RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
       )
     ) {
       return this.fail(RECEIVER_ERROR_CODES.NO_PROGRESS_TIMEOUT, 'No new unique packets for 15 seconds after transfer lock.');
@@ -243,8 +254,8 @@ export class ReceiverMachine {
       && this.receivedPacketCount < this.snapshotValue.totalPackets
       && now - this.snapshotValue.endSeenAt > RECEIVER_TIMEOUTS.END_GRACE_MS
       && (
-        this.snapshotValue.lastLockedTransferFrameAt === null
-        || now - this.snapshotValue.lastLockedTransferFrameAt > RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
+        this.snapshotValue.lastMatchingFrameAt === null
+        || now - this.snapshotValue.lastMatchingFrameAt > RECEIVER_TIMEOUTS.LOCKED_TRANSFER_ACTIVITY_GRACE_MS
       )
     ) {
       return this.fail(RECEIVER_ERROR_CODES.END_INCOMPLETE, 'END frame seen before all packets were received and transfer activity stopped.');
@@ -265,6 +276,7 @@ export class ReceiverMachine {
       return;
     }
 
+    this.snapshotValue.lastMatchingFrameAt = now;
     this.snapshotValue.lastLockedTransferFrameAt = now;
 
     const hasConflict = (
@@ -306,7 +318,9 @@ export class ReceiverMachine {
     this.snapshotValue.expectedFileSize = frame.fileSize;
     this.snapshotValue.totalPackets = frame.totalPackets;
     this.snapshotValue.fileCrc32 = frame.fileCrc32;
+    this.snapshotValue.headerLockedAt = now;
     this.snapshotValue.lastUniquePacketAt = null;
+    this.snapshotValue.lastMatchingFrameAt = now;
     this.snapshotValue.lastLockedTransferFrameAt = now;
     this.packetPayloads = Array.from({ length: frame.totalPackets }, () => null);
     this.packetSeen = new Uint8Array(Math.ceil(frame.totalPackets / 8));
@@ -325,6 +339,7 @@ export class ReceiverMachine {
     if (!this.snapshotValue.lockConfirmed || !this.snapshotValue.transferId || this.snapshotValue.totalPackets === null) return;
     if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
 
+    this.snapshotValue.lastMatchingFrameAt = now;
     this.snapshotValue.lastLockedTransferFrameAt = now;
 
     if (frame.packetIndex < 0 || frame.packetIndex >= this.snapshotValue.totalPackets) return;
@@ -342,6 +357,7 @@ export class ReceiverMachine {
   private applyEnd(frame: TransferEndFrame, now: number): void {
     if (!this.snapshotValue.lockConfirmed || !this.snapshotValue.transferId) return;
     if (transferIdToKey(frame.transferId) !== this.snapshotValue.transferId) return;
+    this.snapshotValue.lastMatchingFrameAt = now;
     this.snapshotValue.lastLockedTransferFrameAt = now;
     this.snapshotValue.endSeenAt = now;
   }
